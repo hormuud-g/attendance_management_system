@@ -1,0 +1,10 @@
+| Usage                      | Color   | HEX |
+| -------------------------- | ------- | --- |
+| 🟢 Primary Green           | #00843D |     |
+| 🔵 Blue Accent             | #0072CE |     |
+| 💚 Light Green Accent      | #00A651 |     |
+| ⚫ Dark Gray (Text)         | #333333 |     |
+| 🩶 Light Gray (Background) | #F5F9F7 |     |
+| 🔴 Red (Danger)            | #C62828 |     |
+| 🟡 Amber (Warning)         | #FFB400 |     |
+| ⚪ White (Surface)          | #FFFFFF |     |

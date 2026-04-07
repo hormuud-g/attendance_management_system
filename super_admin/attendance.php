@@ -1,0 +1,3002 @@
+<?php
+/**
+ * ATTENDANCE MANAGEMENT SYSTEM - COMPLETE CORRECTED CODE
+ * 
+ * Fixed to work with attendance_correction table structure:
+ * - Uses leave_id as primary key
+ * - Uses start_date for correction_date
+ * - Uses is_closed instead of is_executed
+ */
+
+// ============================================
+// INITIALIZATION & CONFIGURATION
+// ============================================
+ob_start();
+if (session_status() === PHP_SESSION_NONE) session_start();
+
+// Database connection
+require_once(__DIR__ . '/../config/db_connect.php');
+
+// ✅ Email Configuration
+define('SMTP_HOST', 'smtp.gmail.com');
+define('SMTP_PORT', 587);
+define('SMTP_USERNAME', 'abdirahmanmohamedabdulle10@gmail.com');
+define('SMTP_PASSWORD', 'cjtenwiqxfnrjqcn');
+define('SMTP_FROM_EMAIL', 'abdirahmanmohamedabdulle10@gmail.com');
+define('SMTP_FROM_NAME', 'Academic Affairs Department');
+
+// ✅ PHPMailer Configuration
+require_once(__DIR__ . '/../lib/PHPMailer-master/src/Exception.php');
+require_once(__DIR__ . '/../lib/PHPMailer-master/src/SMTP.php');
+require_once(__DIR__ . '/../lib/PHPMailer-master/src/PHPMailer.php');
+
+// ✅ Stronger Access Control
+if (!isset($_SESSION['user']) || strtolower($_SESSION['user']['role']) !== 'super_admin') {
+    session_destroy();
+    header("Location: ../login.php?error=unauthorized");
+    exit;
+}
+
+date_default_timezone_set('Africa/Nairobi');
+$message = ""; 
+$type = "";
+
+// ============================================
+// CORE FUNCTIONS (UPDATED FOR CORRECTION TABLE)
+// ============================================
+
+/* ================= AUTOMATIC TEACHER TIMEOUT FUNCTION ================= */
+function autoTimeoutTeachers($pdo) {
+    date_default_timezone_set('Africa/Nairobi');
+    $today = date('Y-m-d');
+    $dayName = date('D', strtotime($today));
+    
+    // Get teachers who should be auto-timed out
+    $autoTeachers = $pdo->query("
+        SELECT 
+            tb.teacher_id, 
+            MAX(tb.end_time) AS last_end_time,
+            COUNT(DISTINCT tb.timetable_id) as total_classes_today
+        FROM timetable tb
+        WHERE tb.day_of_week = '$dayName'
+        GROUP BY tb.teacher_id
+    ")->fetchAll(PDO::FETCH_ASSOC);
+    
+    $autoTimeoutCount = 0;
+    
+    foreach ($autoTeachers as $tt) {
+        $teacher_id = $tt['teacher_id'];
+        $lastEndTime = $tt['last_end_time'];
+        $totalClassesToday = $tt['total_classes_today'];
+        
+        // Calculate auto-out time (10 minutes after last class)
+        $endTime = strtotime($today . ' ' . $lastEndTime);
+        $autoOutTime = $endTime + (10 * 60); // 10 minutes after
+        
+        // Check current attendance status
+        $check = $pdo->prepare("SELECT id, time_in, time_out FROM teacher_attendance WHERE teacher_id=? AND date=?");
+        $check->execute([$teacher_id, $today]);
+        $att = $check->fetch(PDO::FETCH_ASSOC);
+        
+        if ($att && $att['time_in'] && !$att['time_out'] && time() >= $autoOutTime) {
+            $classesMarked = 0;
+            
+            // Check if teacher has marked attendance for all classes today
+            $todayClasses = $pdo->prepare("
+                SELECT t.class_id, t.subject_id 
+                FROM timetable t
+                WHERE t.teacher_id = ? 
+                AND t.day_of_week = '$dayName'
+            ");
+            $todayClasses->execute([$teacher_id]);
+            $classes = $todayClasses->fetchAll(PDO::FETCH_ASSOC);
+            
+            foreach ($classes as $class) {
+                $attendanceCheck = $pdo->prepare("
+                    SELECT COUNT(*) as marked 
+                    FROM attendance 
+                    WHERE teacher_id = ? 
+                    AND class_id = ? 
+                    AND subject_id = ?
+                    AND attendance_date = ?
+                ");
+                $attendanceCheck->execute([
+                    $teacher_id, 
+                    $class['class_id'], 
+                    $class['subject_id'], 
+                    $today
+                ]);
+                $marked = $attendanceCheck->fetch(PDO::FETCH_ASSOC);
+                
+                if ($marked['marked'] > 0) {
+                    $classesMarked++;
+                }
+            }
+            
+            $timeSinceLastClass = time() - $endTime;
+            
+            // Auto timeout if:
+            // 1. Teacher has marked attendance for all classes OR
+            // 2. 30 minutes have passed since last class ended
+            if ($classesMarked >= $totalClassesToday || $timeSinceLastClass > (30 * 60)) {
+                $time_in = strtotime($att['time_in']);
+                $time_out = $autoOutTime;
+                $minutes = round(($time_out - $time_in) / 60);
+                
+                // Cap at 8 hours (480 minutes)
+                if ($minutes > 480) $minutes = 480;
+                
+                $pdo->prepare("
+                    UPDATE teacher_attendance 
+                    SET time_out=?, minutes_worked=?, notes=CONCAT(IFNULL(notes, ''), ' | Auto-Out at ' || ?), updated_at=NOW()
+                    WHERE teacher_id=? AND date=?
+                ")->execute([
+                    date('Y-m-d H:i:s', $autoOutTime),
+                    $minutes,
+                    date('H:i:s', $autoOutTime),
+                    $teacher_id,
+                    $today
+                ]);
+                
+                $autoTimeoutCount++;
+            }
+        }
+    }
+    
+    return $autoTimeoutCount;
+}
+
+/* ================= EMAIL SENDING FUNCTION ================= */
+function sendEmail($to, $subject, $message, $student_id, $message_type, $absence_count, $pdo) {
+    try {
+        $mail = new PHPMailer\PHPMailer\PHPMailer(true);
+        
+        // Server settings
+        $mail->isSMTP();
+        $mail->Host       = SMTP_HOST;
+        $mail->SMTPAuth   = true;
+        $mail->Username   = SMTP_USERNAME;
+        $mail->Password   = SMTP_PASSWORD;
+        $mail->SMTPSecure = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port       = SMTP_PORT;
+
+        // Recipients
+        $mail->setFrom(SMTP_FROM_EMAIL, SMTP_FROM_NAME);
+        $mail->addAddress($to);
+
+        // Content
+        $mail->isHTML(false);
+        $mail->Subject = $subject;
+        $mail->Body    = $message;
+
+        $mail->send();
+        
+        // Log the email
+        $stmt = $pdo->prepare("
+            INSERT INTO email_logs 
+            (student_id, recipient_email, subject, message, message_type, absence_count, sent_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, NOW(), 'sent')
+        ");
+        $stmt->execute([$student_id, $to, $subject, $message, $message_type, $absence_count]);
+        
+        return true;
+    } catch (Exception $e) {
+        // Log the error
+        $stmt = $pdo->prepare("
+            INSERT INTO email_logs 
+            (student_id, recipient_email, subject, message, message_type, absence_count, sent_at, status, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, NOW(), 'failed', ?)
+        ");
+        $stmt->execute([$student_id, $to, $subject, $message, $message_type, $absence_count, $e->getMessage()]);
+        
+        return false;
+    }
+}
+
+/* ================= DIRECT ABSENCE EMAIL ================= */
+function sendDirectAbsenceEmail($student_id, $subject_name, $absence_count, $pdo) {
+    // Get student info
+    $stmt = $pdo->prepare("
+        SELECT 
+            s.full_name AS student_name,
+            s.email AS student_email,
+            p.email AS parent_email,
+            p.full_name AS parent_name
+        FROM students s
+        LEFT JOIN parents p ON s.parent_id = p.parent_id
+        WHERE s.student_id = ?
+    ");
+    $stmt->execute([$student_id]);
+    $student = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$student) return false;
+    
+    $student_name  = $student['student_name'];
+    $student_email = $student['student_email'];
+    $parent_email  = $student['parent_email'];
+    $parent_name   = $student['parent_name'] ?? 'Waalid';
+    
+    // Prepare student message
+    $student_subject = "Digniin Maqnaansho Maanta";
+
+    $student_message = "
+Mudane/Marwo $student_name,
+
+Tani waa fariin rasmi ah oo ka timid Xafiiska Kuliyadaada.
+
+Diiwaannadeenna Attendance System waxay muujinayaan inaad maanta maqantahay, waxaana tani tahay maqnaanshahaaga $absence_count ee maadada: $subject_name.
+
+Fadlan ogow in haddii maqnaanshahaagu gaaro shan (5) jeer, lagaa joojin doono maadadan ($subject_name) waxaana ay noqon doontaa RECOURSE.
+
+Waxaan ku dhiirigelinaynaa inaad ka soo qayb gasho casharrada haray si aad uga fogaato cawaaqib waxbarasho.
+
+Haddii aad u maleyneyso in digniintani ay khalad tahay, fadlan si degdeg ah ula xiriir Xafiiska Arrimaha Tacliinta.
+
+Mahadsanid,
+Xafiiska Arrimaha Tacliinta
+";
+
+    // Prepare parent message
+    $parent_subject = "Ardaygaagu waa Maqan Yahay $parent_name";
+
+    $parent_message = "
+Mudane/Marwo $parent_name,
+
+Tani waa fariin rasmi ah oo ka timid Xafiiska Arrimaha Tacliinta ee jamacadda Hormuud.
+
+Ardaygaaga $student_name maanta waa maqan yahay, waxaana maqnaanshihiisu hadda gaaray $absence_count jeer ee maadada: $subject_name.
+
+Fadlan la soco ka soo qaybgalka casharrada si aad uga fogaato cawaaqib waxbarasho ee ku imaan karto ardaygaaga $student_name.
+
+Mahadsanid,
+Xafiiska Arrimaha Tacliinta
+";
+    
+    $emails_sent = 0;
+    
+    // Send to student
+    if (!empty($student_email) && filter_var($student_email, FILTER_VALIDATE_EMAIL)) {
+        if (sendEmail($student_email, $student_subject, $student_message, $student_id, 'absence', $absence_count, $pdo)) {
+            $emails_sent++;
+        }
+    }
+    
+    // Send to parent
+    if (!empty($parent_email) && filter_var($parent_email, FILTER_VALIDATE_EMAIL)) {
+        if (sendEmail($parent_email, $parent_subject, $parent_message, $student_id, 'absence', $absence_count, $pdo)) {
+            $emails_sent++;
+        }
+    }
+    
+    return $emails_sent > 0;
+}
+
+/* ================= CUMULATIVE ABSENCE EMAIL (RECOURSE) ================= */
+function sendCumulativeAbsenceEmail($student_id, $absence_count, $subject_name, $academic_term_id, $pdo) {
+    try {
+        // Get student details with corrected column aliases
+        $stmt = $pdo->prepare("
+            SELECT 
+                s.full_name as student_name,
+                s.email as student_email,
+                p.email as parent_email,
+                p.full_name as parent_name
+            FROM students s
+            LEFT JOIN parents p ON s.parent_id = p.parent_id
+            WHERE s.student_id = ?
+        ");
+        $stmt->execute([$student_id]);
+        $student = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$student) return false;
+        
+        $student_name = $student['student_name'];
+        $student_email = $student['student_email'];
+        $parent_email = $student['parent_email'];
+        $parent_name = $student['parent_name'] ?? 'Waalid';
+        
+        // For 5+ absences
+        if ($absence_count >= 5) {
+            // Check if recourse email already sent for this term and subject
+            $check_stmt = $pdo->prepare("
+                SELECT COUNT(*) as already_sent 
+                FROM email_logs 
+                WHERE student_id = ? 
+                AND message_type = 'recourse'
+                AND absence_count >= 5
+                AND DATE(sent_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+            ");
+            $check_stmt->execute([$student_id]);
+            $check = $check_stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($check['already_sent'] > 0) {
+                return false; // Already sent recently
+            }
+            
+            $email_student_subject = "Digniin Rebitaanka Maadada – $subject_name";
+            $email_parent_subject = "Ogaaysiis Rebitaan Cashar – $subject_name";
+            
+            $email_student_message = "
+Mudane/Marwo $student_name,
+
+Tani waa fariin rasmi ah oo ka timid Xafiiska Arrimaha Tacliinta.
+
+Waxaan ku ogeysiinaynaa in maqnaanshahaagu ee maadada $subject_name uu gaaray $absence_count jeer.
+Sida ay qabo nidaamka xafiiska, haddii ardaygu gaaro 5 maqnaansho, waxaa la joojinayaa ka qayb-
+galka maadadan.
+
+Dhammaadka maadadan, waa inaad dib u qaadataa maadadan RECOURSE.
+Haddii aad qabto su'aalo, fadlan la xiriir xafiiska arrimaha tacliinta.
+
+Mahadsanid,
+Xafiiska Arrimaha Tacliinta
+";
+            
+            $email_parent_message = "
+Mudane/Marwo $parent_name,
+
+Waxaan ku ogeysiinaynaa in ardaygaaga $student_name uu gaaray $absence_count maqnaansho
+ee maadada $subject_name.
+
+Sida ay qabo nidaamka xafiiska, haddii ardaygu gaaro 5 maqnaansho, waxaa la joojinayaa ka qayb-
+galka maadadan. Ardaygaagu maanta wuu joojinayaa ka qaybgalka maadadan, wuxuuna qaadanayaa
+RECOURSE dhammaadka maadadan.
+
+Fadlan noo soo xiriir haddii aad wax su'aalo qabto.
+
+Mahadsanid,
+Xafiiska Arrimaha Tacliinta
+";
+            
+            $message_type = 'recourse';
+        } else {
+            return false;
+        }
+        
+        $emails_sent = 0;
+        
+        // Send email to student
+        if (!empty($student_email) && filter_var($student_email, FILTER_VALIDATE_EMAIL)) {
+            if (sendEmail($student_email, $email_student_subject, $email_student_message, $student_id, $message_type, $absence_count, $pdo)) {
+                $emails_sent++;
+            }
+        }
+        
+        // Send email to parent
+        if (!empty($parent_email) && filter_var($parent_email, FILTER_VALIDATE_EMAIL)) {
+            if (sendEmail($parent_email, $email_parent_subject, $email_parent_message, $student_id, $message_type, $absence_count, $pdo)) {
+                $emails_sent++;
+            }
+        }
+        
+        return $emails_sent > 0;
+        
+    } catch (Exception $e) {
+        error_log("Cumulative email error: " . $e->getMessage());
+        return false;
+    }
+}
+
+/* ================= ATTENDANCE CORRECTION FUNCTIONS (UPDATED) ================= */
+function requestAttendanceCorrection($student_id, $subject_id, $teacher_id, $academic_term_id, $requested_by, $reason, $reason_details, $correction_date, $original_status, $corrected_status, $pdo) {
+    try {
+        // Store original and corrected status in reason_details
+        $full_reason_details = "original_status:$original_status, corrected_status:$corrected_status, details:" . $reason_details;
+        
+        $stmt = $pdo->prepare("
+            INSERT INTO attendance_correction 
+            (student_id, subject_id, teacher_id, academic_term_id, requested_by, 
+             reason, reason_details, start_date, days_count, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NOW())
+        ");
+        
+        $stmt->execute([
+            $student_id, $subject_id, $teacher_id, $academic_term_id, $requested_by,
+            $reason, $full_reason_details, $correction_date
+        ]);
+        
+        return $pdo->lastInsertId();
+    } catch (Exception $e) {
+        error_log("Correction request error: " . $e->getMessage());
+        return false;
+    }
+}
+
+function approveAttendanceCorrection($leave_id, $approved_by, $pdo) {
+    try {
+        $pdo->beginTransaction();
+        
+        // Get correction details - USING leave_id
+        $stmt = $pdo->prepare("
+            SELECT ac.*, s.full_name as student_name
+            FROM attendance_correction ac
+            JOIN students s ON ac.student_id = s.student_id
+            WHERE ac.leave_id = ? AND ac.status = 'pending'
+        ");
+        $stmt->execute([$leave_id]);
+        $correction = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$correction) {
+            throw new Exception("Correction request not found or already processed");
+        }
+        
+        // Parse original and corrected status from reason_details
+        $reason_details = $correction['reason_details'] ?? '';
+        $original_status = 'absent';
+        $corrected_status = 'present';
+        
+        // Extract status from reason_details
+        if (preg_match('/original_status:(\w+)/', $reason_details, $original_match)) {
+            $original_status = $original_match[1];
+        }
+        if (preg_match('/corrected_status:(\w+)/', $reason_details, $corrected_match)) {
+            $corrected_status = $corrected_match[1];
+        }
+        
+        // Update attendance record
+        $updateStmt = $pdo->prepare("
+            UPDATE attendance 
+            SET status = ?, updated_at = NOW()
+            WHERE student_id = ? 
+            AND subject_id = ? 
+            AND attendance_date = ?
+            AND academic_term_id = ?
+        ");
+        
+        $updateStmt->execute([
+            $corrected_status,
+            $correction['student_id'],
+            $correction['subject_id'],
+            $correction['start_date'],
+            $correction['academic_term_id']
+        ]);
+        
+        if ($updateStmt->rowCount() === 0) {
+            throw new Exception("Attendance record not found");
+        }
+        
+        // Update correction status - USING leave_id and is_closed
+        $updateCorrection = $pdo->prepare("
+            UPDATE attendance_correction 
+            SET status = 'approved', 
+                approved_by = ?, 
+                is_closed = 1,
+                updated_at = NOW()
+            WHERE leave_id = ?
+        ");
+        
+        $updateCorrection->execute([$approved_by, $leave_id]);
+        
+        // If changing from absent to present, recalculate absence count
+        if ($original_status === 'absent' && $corrected_status === 'present') {
+            // Get updated absence count
+            $count_stmt = $pdo->prepare("
+                SELECT COUNT(*) as absence_count 
+                FROM attendance 
+                WHERE student_id = ? 
+                AND subject_id = ? 
+                AND academic_term_id = ? 
+                AND status = 'absent'
+            ");
+            $count_stmt->execute([
+                $correction['student_id'],
+                $correction['subject_id'],
+                $correction['academic_term_id']
+            ]);
+            
+            $count_result = $count_stmt->fetch(PDO::FETCH_ASSOC);
+            $new_absence_count = $count_result['absence_count'];
+            
+            // Check if student should be removed from recourse
+            if ($new_absence_count < 5) {
+                // Remove from recourse if exists
+                $removeRecourse = $pdo->prepare("
+                    UPDATE recourse_student 
+                    SET status = 'cancelled',
+                        updated_at = NOW()
+                    WHERE student_id = ? 
+                    AND subject_id = ?
+                    AND academic_term_id = ?
+                    AND status = 'active'
+                ");
+                $removeRecourse->execute([
+                    $correction['student_id'],
+                    $correction['subject_id'],
+                    $correction['academic_term_id']
+                ]);
+            }
+        }
+        
+        $pdo->commit();
+        
+        // Send notification to student
+        sendCorrectionApprovalNotification($correction, $original_status, $corrected_status, $pdo);
+        
+        return [
+            'success' => true,
+            'student_name' => $correction['student_name'],
+            'original_status' => $original_status,
+            'corrected_status' => $corrected_status,
+            'correction_date' => $correction['start_date']
+        ];
+        
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        error_log("Approval error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => $e->getMessage()
+        ];
+    }
+}
+
+function sendCorrectionApprovalNotification($correction, $original_status, $corrected_status, $pdo) {
+    // Get student email
+    $stmt = $pdo->prepare("
+        SELECT email FROM students WHERE student_id = ?
+    ");
+    $stmt->execute([$correction['student_id']]);
+    $student = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if ($student && !empty($student['email'])) {
+        $subject = "Attendance Correction Approved";
+        $message = "Dear Student,\n\n";
+        $message .= "Your attendance correction request has been approved.\n";
+        $message .= "Date: " . $correction['start_date'] . "\n";
+        $message .= "Original Status: " . ucfirst($original_status) . "\n";
+        $message .= "Corrected Status: " . ucfirst($corrected_status) . "\n\n";
+        $message .= "Your attendance record has been updated accordingly.\n\n";
+        $message .= "Regards,\nAcademic Affairs Department";
+        
+        // Use existing sendEmail function
+        sendEmail(
+            $student['email'],
+            $subject,
+            $message,
+            $correction['student_id'],
+            'correction_approved',
+            0,
+            $pdo
+        );
+    }
+}
+
+function rejectAttendanceCorrection($leave_id, $rejected_by, $rejection_reason, $pdo) {
+    try {
+        $stmt = $pdo->prepare("
+            UPDATE attendance_correction 
+            SET status = 'rejected', 
+                approved_by = ?,
+                is_closed = 1,
+                reason_details = CONCAT(COALESCE(reason_details, ''), ' | Rejection Reason: ', ?),
+                updated_at = NOW()
+            WHERE leave_id = ? AND status = 'pending'
+        ");
+        
+        $stmt->execute([$rejected_by, $rejection_reason, $leave_id]);
+        
+        return $stmt->rowCount() > 0;
+    } catch (Exception $e) {
+        error_log("Rejection error: " . $e->getMessage());
+        return false;
+    }
+}
+
+// ============================================
+// MAIN EXECUTION
+// ============================================
+
+// Run auto timeout on page load
+$autoTimeoutCount = autoTimeoutTeachers($pdo);
+
+/* ================= ACTIVE TERM ================= */
+$term = $pdo->query("SELECT academic_term_id FROM academic_term WHERE status='active' LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+$academic_term_id = $term['academic_term_id'] ?? null;
+if (!$academic_term_id) {
+    $message = "❌ Error: No active academic term found!";
+    $type = "error";
+}
+
+// ===========================================
+// AJAX HANDLERS FOR HIERARCHY
+// ===========================================
+if (isset($_GET['ajax'])) {
+    // GET FACULTIES BY CAMPUS
+    if ($_GET['ajax'] == 'get_faculties_by_campus') {
+        $campus_id = $_GET['campus_id'] ?? 0;
+        
+        $stmt = $pdo->prepare("
+            SELECT DISTINCT f.faculty_id, f.faculty_name 
+            FROM faculties f
+            JOIN faculty_campus fc ON f.faculty_id = fc.faculty_id
+            WHERE fc.campus_id = ?
+            AND f.status = 'active'
+            ORDER BY f.faculty_name
+        ");
+        $stmt->execute([$campus_id]);
+        $faculties = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'faculties' => $faculties]);
+        exit;
+    }
+    
+    // GET DEPARTMENTS BY FACULTY & CAMPUS
+    if ($_GET['ajax'] == 'get_departments_by_faculty') {
+        $faculty_id = $_GET['faculty_id'] ?? 0;
+        $campus_id = $_GET['campus_id'] ?? 0;
+        
+        $stmt = $pdo->prepare("
+            SELECT department_id, department_name 
+            FROM departments 
+            WHERE faculty_id = ? 
+            AND campus_id = ?
+            AND status = 'active'
+            ORDER BY department_name
+        ");
+        $stmt->execute([$faculty_id, $campus_id]);
+        $departments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'departments' => $departments]);
+        exit;
+    }
+    
+    // GET PROGRAMS BY DEPARTMENT, FACULTY & CAMPUS
+    if ($_GET['ajax'] == 'get_programs_by_department') {
+        $department_id = $_GET['department_id'] ?? 0;
+        $faculty_id = $_GET['faculty_id'] ?? 0;
+        $campus_id = $_GET['campus_id'] ?? 0;
+        
+        $stmt = $pdo->prepare("
+            SELECT program_id, program_name 
+            FROM programs 
+            WHERE department_id = ? 
+            AND faculty_id = ?
+            AND campus_id = ?
+            AND status = 'active'
+            ORDER BY program_name
+        ");
+        $stmt->execute([$department_id, $faculty_id, $campus_id]);
+        $programs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'programs' => $programs]);
+        exit;
+    }
+    
+    // GET CLASSES BY PROGRAM, DEPARTMENT, FACULTY & CAMPUS
+    if ($_GET['ajax'] == 'get_classes_by_program') {
+        $program_id = $_GET['program_id'] ?? 0;
+        $department_id = $_GET['department_id'] ?? 0;
+        $faculty_id = $_GET['faculty_id'] ?? 0;
+        $campus_id = $_GET['campus_id'] ?? 0;
+        
+        $stmt = $pdo->prepare("
+            SELECT class_id, class_name 
+            FROM classes 
+            WHERE program_id = ? 
+            AND department_id = ?
+            AND faculty_id = ?
+            AND campus_id = ?
+            AND status = 'Active'
+            ORDER BY class_name
+        ");
+        $stmt->execute([$program_id, $department_id, $faculty_id, $campus_id]);
+        $classes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'classes' => $classes]);
+        exit;
+    }
+    
+    // GET STUDENTS BY CLASS AND CAMPUS (INCLUDING RECOURSE STUDENTS)
+    if ($_GET['ajax'] == 'get_students_by_class') {
+        $class_id = $_GET['class_id'] ?? 0;
+        $campus_id = $_GET['campus_id'] ?? 0;
+        
+        $stmt = $pdo->prepare("
+            (SELECT 
+                s.student_id, 
+                s.full_name, 
+                s.reg_no,
+                s.email as student_email,
+                s.phone_number as student_phone,
+                p.email as parent_email,
+                p.phone as parent_phone,
+                se.semester_id,
+                sem.semester_name,
+                'regular' as student_type
+            FROM students s
+            JOIN student_enroll se ON se.student_id = s.student_id
+            LEFT JOIN semester sem ON sem.semester_id = se.semester_id
+            LEFT JOIN parents p ON s.parent_id = p.parent_id
+            WHERE se.class_id = ? 
+            AND se.campus_id = ?
+            AND s.status = 'active')
+            
+            UNION
+            
+            (SELECT 
+                rs.student_id, 
+                s.full_name, 
+                s.reg_no,
+                s.email as student_email,
+                s.phone_number as student_phone,
+                p.email as parent_email,
+                p.phone as parent_phone,
+                rs.recourse_semester_id as semester_id,
+                sem.semester_name,
+                'recourse' as student_type
+            FROM recourse_student rs
+            JOIN students s ON rs.student_id = s.student_id
+            LEFT JOIN semester sem ON sem.semester_id = rs.recourse_semester_id
+            LEFT JOIN parents p ON s.parent_id = p.parent_id
+            WHERE rs.recourse_class_id = ? 
+            AND rs.recourse_campus_id = ?
+            AND rs.status = 'active'
+            AND (rs.academic_term_id = ? OR rs.academic_term_id IS NULL))
+            
+            ORDER BY full_name
+        ");
+        $stmt->execute([$class_id, $campus_id, $class_id, $campus_id, $academic_term_id]);
+        $students = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'students' => $students]);
+        exit;
+    }
+    
+    // AJAX for attendance correction
+    if ($_GET['ajax'] == 'search_students') {
+        $query = $_GET['query'] ?? '';
+        
+        $stmt = $pdo->prepare("
+            SELECT student_id, full_name, reg_no, email
+            FROM students 
+            WHERE (reg_no LIKE ? OR full_name LIKE ?)
+            AND status = 'active'
+            ORDER BY full_name
+            LIMIT 10
+        ");
+        $searchTerm = "%$query%";
+        $stmt->execute([$searchTerm, $searchTerm]);
+        $students = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'students' => $students]);
+        exit;
+    }
+    
+    // AJAX for getting student attendance
+    if ($_GET['ajax'] == 'get_student_attendance') {
+        $student_id = $_GET['student_id'] ?? 0;
+        $date = $_GET['date'] ?? date('Y-m-d');
+        
+        $stmt = $pdo->prepare("
+            SELECT 
+                a.attendance_id,
+                a.attendance_date,
+                a.status,
+                s.subject_name,
+                s.subject_id,
+                t.teacher_name,
+                c.class_name
+            FROM attendance a
+            LEFT JOIN subject s ON a.subject_id = s.subject_id
+            LEFT JOIN teachers t ON a.teacher_id = t.teacher_id
+            LEFT JOIN classes c ON a.class_id = c.class_id
+            WHERE a.student_id = ? 
+            AND a.attendance_date = ?
+            ORDER BY a.attendance_date DESC
+        ");
+        $stmt->execute([$student_id, $date]);
+        $attendance = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode(['status' => 'success', 'attendance' => $attendance]);
+        exit;
+    }
+    
+    // AJAX for approving correction - UPDATED TO USE leave_id
+    if ($_GET['ajax'] == 'approve_correction') {
+        $leave_id = $_GET['correction_id'] ?? 0;
+        $approved_by = $_SESSION['user']['user_id'] ?? 0;
+        
+        $result = approveAttendanceCorrection($leave_id, $approved_by, $pdo);
+        
+        echo json_encode($result);
+        exit;
+    }
+    
+    // AJAX for rejecting correction - UPDATED TO USE leave_id
+    if ($_GET['ajax'] == 'reject_correction') {
+        $leave_id = $_GET['correction_id'] ?? 0;
+        $rejected_by = $_SESSION['user']['user_id'] ?? 0;
+        $rejection_reason = $_GET['reason'] ?? 'No reason provided';
+        
+        $result = rejectAttendanceCorrection($leave_id, $rejected_by, $rejection_reason, $pdo);
+        
+        echo json_encode(['success' => $result]);
+        exit;
+    }
+}
+
+/* ================= HANDLE ACTIONS ================= */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    try {
+        $pdo->beginTransaction();
+        $action = $_POST['action'];
+
+        // ✅ Input validation
+        $teacher_id = intval($_POST['teacher_id'] ?? 0);
+        $class_id   = intval($_POST['class_id'] ?? 0);
+        $campus_id  = intval($_POST['campus_id'] ?? 0);
+        $date       = trim($_POST['date'] ?? '');
+        
+        if (!$teacher_id || !$date) throw new Exception("Missing required input fields!");
+        if (!$academic_term_id) throw new Exception("No active academic term found!");
+
+        /* ============================================
+           🧑‍🎓 STUDENT ATTENDANCE HANDLING
+           ============================================ */
+        if ($action === 'student_save' || $action === 'student_unlock') {
+            $attendance = $_POST['attendance'] ?? [];
+            $day = date('D', strtotime($date));
+
+            // ✅ Fetch timetable record
+            $q = $pdo->prepare("
+                SELECT subject_id, start_time, end_time 
+                FROM timetable 
+                WHERE class_id=? 
+                AND teacher_id=? 
+                AND day_of_week=? 
+                LIMIT 1
+            ");
+            $q->execute([$class_id, $teacher_id, $day]);
+            $row = $q->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$row) throw new Exception("No timetable found for this teacher/class on $day");
+            $subject_id = $row['subject_id'];
+            
+            // Get subject name
+            $subject_stmt = $pdo->prepare("SELECT subject_name FROM subject WHERE subject_id = ?");
+            $subject_stmt->execute([$subject_id]);
+            $subject = $subject_stmt->fetch(PDO::FETCH_ASSOC);
+            $subject_name = $subject['subject_name'] ?? 'Unknown Subject';
+
+            // 🚫 Prevent past unlock/save
+            if (strtotime($date) < strtotime(date('Y-m-d')))
+                throw new Exception("You cannot modify attendance for past dates.");
+
+            // ✅ Check teacher Time IN
+            $checkTeacherIn = $pdo->prepare("SELECT time_in FROM teacher_attendance WHERE teacher_id=? AND date=?");
+            $checkTeacherIn->execute([$teacher_id, $date]);
+            $teacherAttendance = $checkTeacherIn->fetch(PDO::FETCH_ASSOC);
+            if (!$teacherAttendance || empty($teacherAttendance['time_in']))
+                throw new Exception("Teacher must record Time IN before marking student attendance!");
+
+            // 🔓 Unlock attendance
+            if ($action === 'student_unlock') {
+                $pdo->prepare("DELETE FROM attendance WHERE class_id=? AND teacher_id=? AND subject_id=? AND attendance_date=?")
+                    ->execute([$class_id, $teacher_id, $subject_id, $date]);
+                $message = "🔓 Student attendance unlocked successfully!";
+            } else {
+                // 💾 Save attendance
+                foreach ($attendance as $student_id => $status) {
+                    // Check if attendance already exists
+                    $check = $pdo->prepare("SELECT attendance_id, status FROM attendance WHERE student_id=? AND attendance_date=? AND subject_id=?");
+                    $check->execute([$student_id, $date, $subject_id]);
+                    $existing = $check->fetch();
+                    
+                    if ($existing) {
+                        // Update existing record
+                        $update = $pdo->prepare("
+                            UPDATE attendance 
+                            SET status = ?, updated_at = NOW()
+                            WHERE attendance_id = ?
+                        ");
+                        $update->execute([$status, $existing['attendance_id']]);
+                        
+                        // If changing from present to absent, send email
+                        if ($existing['status'] !== 'absent' && $status === 'absent') {
+                            // Get the new absence count
+                            $count_stmt = $pdo->prepare("
+                                SELECT COUNT(*) as absence_count 
+                                FROM attendance 
+                                WHERE student_id = ? 
+                                AND subject_id = ? 
+                                AND academic_term_id = ? 
+                                AND status = 'absent'
+                            ");
+                            $count_stmt->execute([$student_id, $subject_id, $academic_term_id]);
+                            $count_result = $count_stmt->fetch(PDO::FETCH_ASSOC);
+                            $absence_count = $count_result['absence_count'];
+                            
+                            sendDirectAbsenceEmail($student_id, $subject_name, $absence_count, $pdo);
+                            
+                            if ($absence_count >= 5) {
+                                sendCumulativeAbsenceEmail($student_id, $absence_count, $subject_name, $academic_term_id, $pdo);
+                            }
+                        }
+                    } else {
+                        // Insert new record
+                        $insert = $pdo->prepare("
+                            INSERT INTO attendance 
+                            (student_id, class_id, teacher_id, subject_id, academic_term_id, attendance_date, status, created_at)
+                            VALUES (?,?,?,?,?,?,?,NOW())
+                        ");
+                        $insert->execute([$student_id, $class_id, $teacher_id, $subject_id, $academic_term_id, $date, $status]);
+                        
+                        // ✅ IMMEDIATE EMAIL FOR ABSENCES
+                        if ($status === 'absent') {
+                            // Get the new absence count
+                            $count_stmt = $pdo->prepare("
+                                SELECT COUNT(*) as absence_count 
+                                FROM attendance 
+                                WHERE student_id = ? 
+                                AND subject_id = ? 
+                                AND academic_term_id = ? 
+                                AND status = 'absent'
+                            ");
+                            $count_stmt->execute([$student_id, $subject_id, $academic_term_id]);
+                            $count_result = $count_stmt->fetch(PDO::FETCH_ASSOC);
+                            $absence_count = $count_result['absence_count'];
+                            
+                            sendDirectAbsenceEmail($student_id, $subject_name, $absence_count, $pdo);
+                            
+                            if ($absence_count >= 5) {
+                                sendCumulativeAbsenceEmail($student_id, $absence_count, $subject_name, $academic_term_id, $pdo);
+                            }
+                        }
+                    }
+                }
+                $message = "✅ Student attendance saved successfully!";
+            }
+            $type = "success";
+        }
+
+        /* ============================================
+           👨‍🏫 TEACHER ATTENDANCE HANDLING
+           ============================================ */
+        if ($action === 'teacher_save' || $action === 'teacher_unlock') {
+            $io_action = $_POST['io_action'] ?? '';
+            $note = trim($_POST['notes'] ?? '');
+            $day = date('D', strtotime($date));
+
+            $tcheck = $pdo->prepare("
+                SELECT MIN(start_time) AS start_time, MAX(end_time) AS end_time 
+                FROM timetable 
+                WHERE teacher_id=? AND day_of_week=?
+            ");
+            $tcheck->execute([$teacher_id, $day]);
+            $timetable = $tcheck->fetch(PDO::FETCH_ASSOC);
+            if (!$timetable || !$timetable['start_time']) throw new Exception("No timetable found for this teacher today.");
+
+            $start = strtotime($timetable['start_time']) - 600; // 10 minutes before
+            $end = strtotime($timetable['end_time']) + 600; // 10 minutes after
+            $now = time();
+            
+            if ($action === 'teacher_save') {
+                if ($now < $start || $now > $end) {
+                    throw new Exception("You can only record attendance 10 minutes before/after class hours.");
+                }
+            }
+            
+            if (strtotime($date) < strtotime(date('Y-m-d'))) throw new Exception("You cannot record or unlock attendance for past days.");
+
+            $check = $pdo->prepare("SELECT id, time_in, time_out FROM teacher_attendance WHERE teacher_id=? AND date=?");
+            $check->execute([$teacher_id, $date]);
+            $existing = $check->fetch(PDO::FETCH_ASSOC);
+
+            if ($action === 'teacher_unlock') {
+                if (!$existing) throw new Exception("No attendance record found to unlock.");
+                if ($io_action === 'In') {
+                    $pdo->prepare("DELETE FROM teacher_attendance WHERE teacher_id=? AND date=?")->execute([$teacher_id, $date]);
+                    $pdo->prepare("DELETE FROM attendance WHERE teacher_id=? AND attendance_date=?")->execute([$teacher_id, $date]);
+                    $message = "🔓 All attendance data unlocked successfully!";
+                } elseif ($io_action === 'Out') {
+                    $pdo->prepare("UPDATE teacher_attendance SET time_out=NULL, minutes_worked=NULL, notes=NULL, updated_at=NOW() WHERE teacher_id=? AND date=?")
+                        ->execute([$teacher_id, $date]);
+                    $message = "🔓 Time OUT unlocked successfully!";
+                } else throw new Exception("Select valid unlock action (In/Out)!");
+            } else {
+                if ($io_action === 'In') {
+                    if ($existing && $existing['time_in']) throw new Exception("Time IN already recorded!");
+                    if ($existing) {
+                        $pdo->prepare("UPDATE teacher_attendance SET time_in=?, notes=?, updated_at=NOW() WHERE teacher_id=? AND date=?")
+                            ->execute([date('Y-m-d H:i:s'), $note, $teacher_id, $date]);
+                    } else {
+                        $pdo->prepare("
+                            INSERT INTO teacher_attendance 
+                            (teacher_id, academic_term_id, date, time_in, notes, created_at)
+                            VALUES (?,?,?,?,?,NOW())
+                        ")->execute([$teacher_id, $academic_term_id, $date, date('Y-m-d H:i:s'), $note]);
+                    }
+                    $message = "✅ Teacher Time IN recorded successfully!";
+                } elseif ($io_action === 'Out') {
+                    if (!$existing || !$existing['time_in']) throw new Exception("Time IN not found! Please record IN first.");
+                    if ($existing['time_out']) throw new Exception("Time OUT already recorded!");
+                    $time_in = strtotime($existing['time_in']);
+                    $time_out = time();
+                    $minutes = round(($time_out - $time_in) / 60);
+                    $pdo->prepare("
+                        UPDATE teacher_attendance 
+                        SET time_out=?, minutes_worked=?, notes=?, updated_at=NOW()
+                        WHERE teacher_id=? AND date=?
+                    ")->execute([date('Y-m-d H:i:s'), $minutes, $note, $teacher_id, $date]);
+                    $message = "✅ Teacher Time OUT recorded! Worked $minutes minutes.";
+                } else throw new Exception("Select valid In/Out action!");
+            }
+            $type = "success";
+        }
+        
+        /* ============================================
+           📝 ATTENDANCE CORRECTION REQUEST (UPDATED)
+           ============================================ */
+        if ($action === 'request_correction') {
+            $student_id = intval($_POST['student_id'] ?? 0);
+            $subject_id = intval($_POST['subject_id'] ?? 0);
+            $reason = $_POST['reason'] ?? '';
+            $reason_details = trim($_POST['reason_details'] ?? '');
+            $correction_date = $_POST['correction_date'] ?? '';
+            $original_status = $_POST['original_status'] ?? '';
+            $corrected_status = $_POST['corrected_status'] ?? '';
+            $requested_by = $_SESSION['user']['user_id'] ?? 0;
+            
+            if (!$student_id || !$reason || !$correction_date || !$original_status || !$corrected_status) {
+                throw new Exception("All required fields must be filled!");
+            }
+            
+            // Get teacher_id from attendance record
+            $teacherStmt = $pdo->prepare("
+                SELECT teacher_id FROM attendance 
+                WHERE student_id = ? 
+                AND subject_id = ? 
+                AND attendance_date = ?
+                LIMIT 1
+            ");
+            $teacherStmt->execute([$student_id, $subject_id, $correction_date]);
+            $attendance = $teacherStmt->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$attendance) {
+                throw new Exception("Attendance record not found!");
+            }
+            
+            $teacher_id = $attendance['teacher_id'];
+            
+            // Create correction request - using updated function
+            $correction_id = requestAttendanceCorrection(
+                $student_id, $subject_id, $teacher_id, $academic_term_id, 
+                $requested_by, $reason, $reason_details, $correction_date, 
+                $original_status, $corrected_status, $pdo
+            );
+            
+            if ($correction_id) {
+                $message = "✅ Correction request submitted successfully! It will be reviewed by admin.";
+                $type = "success";
+            } else {
+                throw new Exception("Failed to submit correction request.");
+            }
+        }
+
+        $pdo->commit();
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $message = "❌ Error: " . $e->getMessage();
+        $type = "error";
+    }
+}
+
+// ============================================
+// DATA FETCHING FOR DISPLAY
+// ============================================
+
+// ✅ Teachers
+$teachers = $pdo->query("SELECT teacher_id, teacher_name FROM teachers WHERE status='active' ORDER BY teacher_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+
+// ✅ Campuses
+$campuses = $pdo->query("SELECT campus_id, campus_name FROM campus WHERE status='active' ORDER BY campus_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+
+// ✅ Cascade filters
+$faculties = $departments = $programs = $classes = [];
+
+// If POST data exists, load the hierarchy
+if (!empty($_POST['campus_id'])) {
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT f.faculty_id, f.faculty_name 
+        FROM faculties f
+        JOIN faculty_campus fc ON f.faculty_id = fc.faculty_id
+        WHERE fc.campus_id = ?
+        AND f.status = 'active'
+        ORDER BY f.faculty_name
+    ");
+    $stmt->execute([$_POST['campus_id']]);
+    $faculties = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+if (!empty($_POST['faculty_id']) && !empty($_POST['campus_id'])) {
+    $stmt = $pdo->prepare("
+        SELECT department_id, department_name 
+        FROM departments 
+        WHERE faculty_id = ? 
+        AND campus_id = ?
+        AND status = 'active'
+        ORDER BY department_name
+    ");
+    $stmt->execute([$_POST['faculty_id'], $_POST['campus_id']]);
+    $departments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+if (!empty($_POST['department_id']) && !empty($_POST['faculty_id']) && !empty($_POST['campus_id'])) {
+    $stmt = $pdo->prepare("
+        SELECT program_id, program_name 
+        FROM programs 
+        WHERE department_id = ? 
+        AND faculty_id = ?
+        AND campus_id = ?
+        AND status = 'active'
+        ORDER BY program_name
+    ");
+    $stmt->execute([
+        $_POST['department_id'],
+        $_POST['faculty_id'],
+        $_POST['campus_id']
+    ]);
+    $programs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+if (!empty($_POST['program_id']) && !empty($_POST['department_id']) && !empty($_POST['faculty_id']) && !empty($_POST['campus_id'])) {
+    $stmt = $pdo->prepare("
+        SELECT class_id, class_name 
+        FROM classes 
+        WHERE program_id = ? 
+        AND department_id = ?
+        AND faculty_id = ?
+        AND campus_id = ?
+        AND status = 'Active'
+        ORDER BY class_name
+    ");
+    $stmt->execute([
+        $_POST['program_id'],
+        $_POST['department_id'],
+        $_POST['faculty_id'],
+        $_POST['campus_id']
+    ]);
+    $classes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/* 👩‍🎓 Load Students if timetable exists */
+$students = [];
+
+if (isset($_POST['load_students'])) {
+    $class_id   = intval($_POST['class_id'] ?? 0);
+    $teacher_id = intval($_POST['teacher_id'] ?? 0);
+    $campus_id  = intval($_POST['campus_id'] ?? 0);
+    $date       = $_POST['date'] ?? date('Y-m-d');
+    $day        = date('D', strtotime($date));
+
+    // Check if teacher has class on this day
+    $chk = $pdo->prepare("
+        SELECT subject_id
+        FROM timetable
+        WHERE class_id = ?
+          AND teacher_id = ?
+          AND day_of_week = ?
+    ");
+    $chk->execute([$class_id, $teacher_id, $day]);
+
+    if ($chk->fetch()) {
+
+        $stmt = $pdo->prepare("
+            (SELECT 
+                s.student_id,
+                s.full_name,
+                s.reg_no,
+                s.email AS student_email,
+                s.phone_number AS student_phone,
+                p.email AS parent_email,
+                p.phone AS parent_phone,
+                se.semester_id,
+                sem.semester_name,
+                a.status AS attendance_status,
+                'regular' AS student_type
+            FROM students s
+            JOIN student_enroll se ON se.student_id = s.student_id
+            LEFT JOIN semester sem ON sem.semester_id = se.semester_id
+            LEFT JOIN parents p ON s.parent_id = p.parent_id
+            LEFT JOIN attendance a 
+                ON a.student_id = s.student_id
+               AND a.attendance_date = ?
+               AND a.class_id = ?
+            WHERE se.class_id = ?
+              AND se.campus_id = ?
+              AND s.status = 'active')
+
+            UNION
+
+            (SELECT 
+                rs.student_id,
+                s.full_name,
+                s.reg_no,
+                s.email AS student_email,
+                s.phone_number AS student_phone,
+                p.email AS parent_email,
+                p.phone AS parent_phone,
+                rs.recourse_semester_id AS semester_id,
+                sem.semester_name,
+                a.status AS attendance_status,
+                'recourse' AS student_type
+            FROM recourse_student rs
+            JOIN students s ON rs.student_id = s.student_id
+            LEFT JOIN semester sem ON sem.semester_id = rs.recourse_semester_id
+            LEFT JOIN parents p ON s.parent_id = p.parent_id
+            LEFT JOIN attendance a 
+                ON a.student_id = rs.student_id
+               AND a.attendance_date = ?
+               AND a.class_id = rs.recourse_class_id
+            WHERE rs.recourse_class_id = ?
+              AND rs.recourse_campus_id = ?
+              AND rs.status = 'active'
+              AND (rs.academic_term_id = ? OR rs.academic_term_id IS NULL))
+
+            ORDER BY full_name
+        ");
+
+        // ✅ 8 placeholders → 8 values
+        $stmt->execute([
+            // regular students
+            $date,
+            $class_id,
+            $class_id,
+            $campus_id,
+
+            // recourse students
+            $date,
+            $class_id,
+            $campus_id,
+            $academic_term_id
+        ]);
+
+        $students = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+}
+
+// ✅ Get Email Logs
+try {
+    $email_logs = $pdo->query("
+        SELECT 
+            el.log_id,
+            el.student_id,
+            s.full_name,
+            el.recipient_email,
+            el.subject,
+            el.message_type,
+            el.absence_count,
+            el.sent_at,
+            el.status,
+            el.error_message
+        FROM email_logs el
+        LEFT JOIN students s ON s.student_id = el.student_id
+        ORDER BY el.sent_at DESC
+        LIMIT 50
+    ")->fetchAll(PDO::FETCH_ASSOC);
+} catch (Exception $e) {
+    $email_logs = [];
+}
+
+// ✅ Attendance Views (INCLUDING RECOURSE STUDENTS)
+$attendance_view = $pdo->query("
+    SELECT 
+        a.attendance_date, 
+        s.full_name, 
+        s.reg_no, 
+        s.email as student_email,
+        s.phone_number as student_phone,
+        p.email as parent_email,
+        p.phone as parent_phone,
+        c.class_name, 
+        t.teacher_name, 
+        a.status,
+        sub.subject_name,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM recourse_student rs 
+                WHERE rs.student_id = a.student_id 
+                AND rs.subject_id = a.subject_id 
+                AND (rs.academic_term_id = a.academic_term_id OR rs.academic_term_id IS NULL)
+                AND rs.status = 'active'
+            ) THEN 'Recourse'
+            ELSE 'Regular'
+        END as student_type
+    FROM attendance a
+    JOIN students s ON s.student_id = a.student_id
+    JOIN classes c ON c.class_id = a.class_id
+    JOIN teachers t ON t.teacher_id = a.teacher_id
+    LEFT JOIN subject sub ON sub.subject_id = a.subject_id
+    LEFT JOIN parents p ON s.parent_id = p.parent_id
+    ORDER BY a.attendance_date DESC
+    LIMIT 50
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// ✅ Recourse Students Status Check - Mark completed recourse students
+$completed_recourse = $pdo->prepare("
+    UPDATE recourse_student rs
+    SET rs.status = 'completed'
+    WHERE rs.academic_term_id < ? 
+    AND rs.status = 'active'
+");
+$completed_recourse->execute([$academic_term_id]);
+
+// Get all recourse students
+$recourse_students = $pdo->query("
+    SELECT 
+        rs.recourse_id,
+        s.full_name,
+        s.reg_no,
+        sub.subject_name,
+        oc.campus_name as original_campus,
+        ofc.faculty_name as original_faculty,
+        od.department_name as original_department,
+        op.program_name as original_program,
+        oc2.class_name as original_class,
+        rc.campus_name as recourse_campus,
+        rfc.faculty_name as recourse_faculty,
+        rd.department_name as recourse_department,
+        rp.program_name as recourse_program,
+        rc2.class_name as recourse_class,
+        rs.academic_term_id,
+        at.term_name,
+        rs.status,
+        rs.created_at
+    FROM recourse_student rs
+    JOIN students s ON rs.student_id = s.student_id
+    LEFT JOIN subject sub ON rs.subject_id = sub.subject_id
+    LEFT JOIN campus oc ON rs.original_campus_id = oc.campus_id
+    LEFT JOIN faculties ofc ON rs.original_faculty_id = ofc.faculty_id
+    LEFT JOIN departments od ON rs.original_department_id = od.department_id
+    LEFT JOIN programs op ON rs.original_program_id = op.program_id
+    LEFT JOIN classes oc2 ON rs.original_class_id = oc2.class_id
+    LEFT JOIN campus rc ON rs.recourse_campus_id = rc.campus_id
+    LEFT JOIN faculties rfc ON rs.recourse_faculty_id = rfc.faculty_id
+    LEFT JOIN departments rd ON rs.recourse_department_id = rd.department_id
+    LEFT JOIN programs rp ON rs.recourse_program_id = rp.program_id
+    LEFT JOIN classes rc2 ON rs.recourse_class_id = rc2.class_id
+    LEFT JOIN academic_term at ON rs.academic_term_id = at.academic_term_id
+    ORDER BY rs.created_at DESC
+")->fetchAll(PDO::FETCH_ASSOC);
+
+$teacher_view = $pdo->query("
+    SELECT 
+        ta.date, 
+        t.teacher_name, 
+        ta.time_in, 
+        ta.time_out, 
+        ta.minutes_worked, 
+        ta.notes
+    FROM teacher_attendance ta
+    JOIN teachers t ON t.teacher_id = ta.teacher_id
+    ORDER BY ta.date DESC
+    LIMIT 50
+")->fetchAll(PDO::FETCH_ASSOC);
+
+/* ================= FETCH PENDING CORRECTIONS (UPDATED) ================= */
+$pending_corrections = $pdo->query("
+    SELECT 
+        ac.leave_id as correction_id,
+        ac.student_id,
+        s.full_name as student_name,
+        s.reg_no,
+        sub.subject_name,
+        t.teacher_name,
+        ac.reason,
+        ac.reason_details,
+        ac.start_date as correction_date,
+        ac.created_at,
+        u.username as requested_by
+    FROM attendance_correction ac
+    JOIN students s ON ac.student_id = s.student_id
+    LEFT JOIN subject sub ON ac.subject_id = sub.subject_id
+    LEFT JOIN teachers t ON ac.teacher_id = t.teacher_id
+    LEFT JOIN users u ON ac.requested_by = u.user_id
+    WHERE ac.status = 'pending'
+    ORDER BY ac.created_at DESC
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// Parse original and corrected status for display
+foreach ($pending_corrections as &$corr) {
+    $original_status = 'absent';
+    $corrected_status = 'present';
+    
+    if (preg_match('/original_status:(\w+)/', $corr['reason_details'] ?? '', $original_match)) {
+        $original_status = $original_match[1];
+    }
+    if (preg_match('/corrected_status:(\w+)/', $corr['reason_details'] ?? '', $corrected_match)) {
+        $corrected_status = $corrected_match[1];
+    }
+    
+    // Remove status info from display
+    $corr['reason_details'] = preg_replace('/original_status:\w+, corrected_status:\w+, details:/', '', $corr['reason_details'] ?? '');
+    $corr['original_status'] = $original_status;
+    $corr['corrected_status'] = $corrected_status;
+}
+
+/* ================= FETCH APPROVED CORRECTIONS (UPDATED) ================= */
+$approved_corrections = $pdo->query("
+    SELECT 
+        ac.leave_id as correction_id,
+        ac.student_id,
+        s.full_name as student_name,
+        s.reg_no,
+        sub.subject_name,
+        ac.reason,
+        ac.reason_details,
+        ac.start_date as correction_date,
+        ac.created_at,
+        u1.username as requested_by,
+        u2.username as approved_by,
+        ac.updated_at as approved_at
+    FROM attendance_correction ac
+    JOIN students s ON ac.student_id = s.student_id
+    LEFT JOIN subject sub ON ac.subject_id = sub.subject_id
+    LEFT JOIN users u1 ON ac.requested_by = u1.user_id
+    LEFT JOIN users u2 ON ac.approved_by = u2.user_id
+    WHERE ac.status = 'approved'
+    ORDER BY ac.updated_at DESC
+    LIMIT 50
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// Parse status for approved corrections
+foreach ($approved_corrections as &$corr) {
+    $original_status = 'absent';
+    $corrected_status = 'present';
+    
+    if (preg_match('/original_status:(\w+)/', $corr['reason_details'] ?? '', $original_match)) {
+        $original_status = $original_match[1];
+    }
+    if (preg_match('/corrected_status:(\w+)/', $corr['reason_details'] ?? '', $corrected_match)) {
+        $corrected_status = $corrected_match[1];
+    }
+    
+    $corr['original_status'] = $original_status;
+    $corr['corrected_status'] = $corrected_status;
+}
+
+/* ================= FETCH REJECTED CORRECTIONS (UPDATED) ================= */
+$rejected_corrections = $pdo->query("
+    SELECT 
+        ac.leave_id as correction_id,
+        ac.student_id,
+        s.full_name as student_name,
+        s.reg_no,
+        sub.subject_name,
+        ac.reason,
+        ac.reason_details,
+        ac.start_date as correction_date,
+        ac.created_at,
+        u.username as requested_by,
+        ac.updated_at as rejected_at
+    FROM attendance_correction ac
+    JOIN students s ON ac.student_id = s.student_id
+    LEFT JOIN subject sub ON ac.subject_id = sub.subject_id
+    LEFT JOIN users u ON ac.requested_by = u.user_id
+    WHERE ac.status = 'rejected'
+    ORDER BY ac.updated_at DESC
+    LIMIT 20
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// Parse status for rejected corrections
+foreach ($rejected_corrections as &$corr) {
+    $original_status = 'absent';
+    $corrected_status = 'present';
+    
+    if (preg_match('/original_status:(\w+)/', $corr['reason_details'] ?? '', $original_match)) {
+        $original_status = $original_match[1];
+    }
+    if (preg_match('/corrected_status:(\w+)/', $corr['reason_details'] ?? '', $corrected_match)) {
+        $corrected_status = $corrected_match[1];
+    }
+    
+    $corr['original_status'] = $original_status;
+    $corr['corrected_status'] = $corrected_status;
+}
+
+// ✅ Manual email sending trigger
+if (isset($_GET['send_absence_emails']) && $_GET['send_absence_emails'] == 'now') {
+    $today = date('Y-m-d');
+    $stmt = $pdo->prepare("
+        SELECT a.student_id, a.subject_id, 
+               (SELECT COUNT(*) 
+                FROM attendance a2 
+                WHERE a2.student_id = a.student_id 
+                  AND a2.subject_id = a.subject_id 
+                  AND a2.academic_term_id = a.academic_term_id 
+                  AND a2.status = 'absent') as absence_count
+        FROM attendance a
+        WHERE a.attendance_date = ? 
+          AND a.status = 'absent'
+          AND a.academic_term_id = ?
+        GROUP BY a.student_id, a.subject_id, a.academic_term_id
+    ");
+    $stmt->execute([$today, $academic_term_id]);
+    $absent_students = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $sent_count = 0;
+    foreach ($absent_students as $record) {
+        // Get subject name
+        $subject_stmt = $pdo->prepare("SELECT subject_name FROM subject WHERE subject_id = ?");
+        $subject_stmt->execute([$record['subject_id']]);
+        $subject = $subject_stmt->fetch(PDO::FETCH_ASSOC);
+        $subject_name = $subject['subject_name'] ?? 'Unknown Subject';
+        
+        if (sendDirectAbsenceEmail($record['student_id'], $subject_name, $record['absence_count'], $pdo)) {
+            $sent_count++;
+        }
+    }
+    
+    $message = "✅ Sent $sent_count absence emails for today!";
+    $type = "success";
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attendance Management</title>
+    <link rel="icon" type="image/png" href="../images.png">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        body { font-family: 'Poppins', sans-serif; background: #f7f9fb; margin: 0; padding: 0; }
+        .main-content { padding: 25px; }
+        .page-header { margin-bottom: 25px; padding-bottom: 15px; border-bottom: 2px solid #0072CE; }
+        .page-header h1 { color: #0072CE; font-weight: 600; font-size: 28px; margin: 0; }
+        .tabs { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; position: relative; }
+        .tab-btn { background: #0072CE; color: #fff; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; transition: all 0.3s ease; position: relative; }
+        .tab-btn:hover { background: #005ba1; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0, 114, 206, 0.2); }
+        .tab-btn.active { background: #00843D; }
+        .tab-btn.active:hover { background: #006b30; }
+        .tab-content { display: none; animation: fadeIn 0.4s ease; }
+        .tab-content.active { display: block; }
+        .filter-box { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08); margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+        label { font-weight: 600; color: #0072CE; font-size: 14px; margin-bottom: 5px; display: block; }
+        select, input, textarea { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; font-size: 14px; transition: all 0.3s ease; }
+        select:focus, input:focus, textarea:focus { outline: none; border-color: #0072CE; background: #fff; box-shadow: 0 0 0 3px rgba(0, 114, 206, 0.1); }
+        .btn { border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; display: inline-flex; align-items: center; gap: 8px; transition: all 0.3s ease; }
+        .btn.green { background: #00843D; color: #fff; }
+        .btn.green:hover { background: #006b30; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0, 132, 61, 0.2); }
+        .btn.red { background: #C62828; color: #fff; }
+        .btn.red:hover { background: #a81f1f; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(198, 40, 40, 0.2); }
+        .btn.blue { background: #0072CE; color: #fff; }
+        .btn.blue:hover { background: #005ba1; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0, 114, 206, 0.2); }
+        .btn.yellow { background: #ffc107; color: #333; }
+        .btn.yellow:hover { background: #e0a800; transform: translateY(-2px); }
+        .table-wrapper { overflow: auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; min-width: 800px; }
+        th, td { padding: 14px 16px; border-bottom: 1px solid #eee; text-align: left; font-size: 14px; }
+        thead th { background: #0072CE; color: #fff; position: sticky; top: 0; font-weight: 600; text-transform: uppercase; font-size: 13px; letter-spacing: 0.5px; }
+        tbody tr:hover { background: #f3f8ff; }
+        .actions { text-align: center; padding: 20px; display: flex; gap: 15px; justify-content: center; }
+        .alert { position: fixed; top: 20px; right: 20px; background: #00843D; color: #fff; padding: 15px 25px; border-radius: 8px; font-weight: 600; z-index: 9999; box-shadow: 0 4px 15px rgba(0, 132, 61, 0.3); animation: slideIn 0.3s ease; }
+        .alert.error { background: #C62828; box-shadow: 0 4px 15px rgba(198, 40, 40, 0.3); }
+        .student-type-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+        .student-type-badge.regular { background-color: #e3f2fd; color: #1976d2; }
+        .student-type-badge.recourse { background-color: #fff3e0; color: #f57c00; }
+        .student-type-badge.completed { background-color: #e8f5e9; color: #2e7d32; }
+        .student-type-badge.cancelled { background-color: #ffebee; color: #c62828; }
+        .email-status { font-size: 12px; padding: 4px 10px; border-radius: 10px; display: inline-flex; align-items: center; gap: 5px; margin: 2px 0; }
+        .email-status.sent { background: #e8f5e9; color: #2e7d32; }
+        .email-status.missing { background: #ffebee; color: #c62828; }
+        .notification-badge { position: absolute; top: -5px; right: -5px; background: #ff5722; color: white; border-radius: 50%; width: 20px; height: 20px; font-size: 11px; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+        .attendance-buttons { display: flex; gap: 10px; }
+        .attendance-btn { min-width: 80px; padding: 8px 15px; border-radius: 6px; border: 1px solid #ddd; background: #fff; cursor: pointer; transition: all 0.3s ease; font-weight: 500; }
+        .attendance-btn.present { border-color: #28a745; color: #28a745; }
+        .attendance-btn.present:hover, .attendance-btn.present.selected { background: #28a745; color: white; }
+        .attendance-btn.absent { border-color: #dc3545; color: #dc3545; }
+        .attendance-btn.absent:hover, .attendance-btn.absent.selected { background: #dc3545; color: white; }
+        .attendance-btn.late { border-color: #ffc107; color: #ffc107; }
+        .attendance-btn.late:hover, .attendance-btn.late.selected { background: #ffc107; color: #333; }
+        .attendance-btn.excused { border-color: #007bff; color: #007bff; }
+        .attendance-btn.excused:hover, .attendance-btn.excused.selected { background: #007bff; color: white; }
+        .badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+        .badge.bg-warning { background: #ffc107 !important; color: #333; }
+        .badge.bg-danger { background: #dc3545 !important; color: white; }
+        .badge.bg-secondary { background: #6c757d !important; color: white; }
+        .badge.bg-success { background: #28a745 !important; color: white; }
+        .correction-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; justify-content: center; align-items: center; }
+        .correction-modal-content { background: white; padding: 30px; border-radius: 12px; width: 90%; max-width: 500px; max-height: 80vh; overflow-y: auto; }
+        .status-badge { padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+        .status-badge.pending { background: #fff3cd; color: #856404; }
+        .status-badge.approved { background: #d4edda; color: #155724; }
+        .status-badge.rejected { background: #f8d7da; color: #721c24; }
+        .status-change { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px; border-radius: 8px; background: #f8f9fa; margin: 5px 0; }
+        .status-change .from { color: #dc3545; font-weight: bold; }
+        .status-change .to { color: #28a745; font-weight: bold; }
+        .status-change .arrow { color: #6c757d; }
+        .student-result { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; transition: background 0.2s; }
+        .student-result:hover { background: #f3f8ff; }
+        .student-result strong { display: block; font-size: 14px; }
+        .student-result small { font-size: 12px; color: #666; }
+        .reject-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 10000; justify-content: center; align-items: center; }
+        .reject-modal-content { background: white; padding: 25px; border-radius: 12px; width: 90%; max-width: 400px; }
+        .subtab-content { display: none; }
+        .subtab-content.active { display: block; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @media (max-width: 768px) {
+            .main-content { padding: 15px; }
+            .grid { grid-template-columns: 1fr; }
+            .tabs { flex-direction: column; }
+            .tab-btn { width: 100%; justify-content: center; }
+            .actions { flex-direction: column; }
+            .actions .btn { width: 100%; justify-content: center; }
+            .attendance-buttons { flex-wrap: wrap; }
+            .attendance-btn { min-width: 60px; padding: 6px 10px; font-size: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <?php include('../includes/header.php'); ?>
+
+    <div class="main-content">
+        <div class="page-header">
+            <h1><i class="fas fa-clipboard-check"></i> Attendance Management System</h1>
+            <?php if ($autoTimeoutCount > 0): ?>
+                <div style="color: #0072CE; font-size: 14px; margin-top: 5px;">
+                    <i class="fas fa-robot"></i> Auto-timed out <?php echo $autoTimeoutCount; ?> teacher(s) today
+                </div>
+            <?php endif; ?>
+        </div>
+        
+        <?php if ($message): ?>
+            <div class="alert <?php echo $type === 'success' ? 'alert-success' : 'error'; ?>">
+                <strong><?php echo htmlspecialchars($message); ?></strong>
+            </div>
+            <script>
+                setTimeout(() => {
+                    const alert = document.querySelector('.alert');
+                    if (alert) alert.remove();
+                }, 5000);
+            </script>
+        <?php endif; ?>
+
+        <!-- ✅ Tabs -->
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="tab1">
+                <i class="fas fa-user-check"></i> Student Record
+            </button>
+            <button class="tab-btn" data-tab="tab2">
+                <i class="fas fa-list"></i> Student View
+            </button>
+            <button class="tab-btn" data-tab="tab3">
+                <i class="fas fa-chalkboard-teacher"></i> Teacher Record
+            </button>
+            <button class="tab-btn" data-tab="tab4">
+                <i class="fas fa-eye"></i> Teacher View
+            </button>
+         
+            <button class="tab-btn" data-tab="tab5">
+                <i class="fas fa-envelope"></i> Email Logs
+                <?php if (!empty($email_logs)): ?>
+                    <span class="notification-badge"><?php echo count($email_logs); ?></span>
+                <?php endif; ?>
+            </button>
+          
+        </div>
+
+        <!-- ================= TAB 1: STUDENT RECORD ================= -->
+        <div id="tab1" class="tab-content active">
+            <div class="filter-box">
+                <form method="POST" id="studentForm">
+                    <div class="grid">
+                        <!-- 🏫 CAMPUS -->
+                        <div>
+                            <label><i class="fas fa-university"></i> Campus</label>
+                            <select name="campus_id" id="campus_id" class="form-select" required>
+                                <option value="">Select Campus</option>
+                                <?php foreach ($campuses as $c): ?>
+                                    <option value="<?php echo $c['campus_id']; ?>" <?php echo ($_POST['campus_id'] ?? '') == $c['campus_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($c['campus_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 🏛 FACULTY -->
+                        <div>
+                            <label><i class="fas fa-graduation-cap"></i> Faculty</label>
+                            <select name="faculty_id" id="faculty_id" class="form-select" disabled>
+                                <option value="">Select Faculty</option>
+                                <?php foreach ($faculties as $f): ?>
+                                    <option value="<?php echo $f['faculty_id']; ?>" <?php echo ($_POST['faculty_id'] ?? '') == $f['faculty_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($f['faculty_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 🧩 DEPARTMENT -->
+                        <div>
+                            <label><i class="fas fa-building"></i> Department</label>
+                            <select name="department_id" id="department_id" class="form-select" disabled>
+                                <option value="">Select Department</option>
+                                <?php foreach ($departments as $d): ?>
+                                    <option value="<?php echo $d['department_id']; ?>" <?php echo ($_POST['department_id'] ?? '') == $d['department_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($d['department_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 🎓 PROGRAM -->
+                        <div>
+                            <label><i class="fas fa-book"></i> Program</label>
+                            <select name="program_id" id="program_id" class="form-select" disabled>
+                                <option value="">Select Program</option>
+                                <?php foreach ($programs as $p): ?>
+                                    <option value="<?php echo $p['program_id']; ?>" <?php echo ($_POST['program_id'] ?? '') == $p['program_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($p['program_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 🧑‍🎓 CLASS -->
+                        <div>
+                            <label><i class="fas fa-users"></i> Class</label>
+                            <select name="class_id" id="class_id" class="form-select" disabled>
+                                <option value="">Select Class</option>
+                                <?php foreach ($classes as $cls): ?>
+                                    <option value="<?php echo $cls['class_id']; ?>" <?php echo ($_POST['class_id'] ?? '') == $cls['class_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($cls['class_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 👨‍🏫 TEACHER -->
+                        <div>
+                            <label><i class="fas fa-chalkboard-teacher"></i> Teacher</label>
+                            <select name="teacher_id" id="teacher_id" class="form-select" required>
+                                <option value="">Select Teacher</option>
+                                <?php foreach ($teachers as $t): ?>
+                                    <option value="<?php echo $t['teacher_id']; ?>" <?php echo ($_POST['teacher_id'] ?? '') == $t['teacher_id'] ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($t['teacher_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 📅 DATE -->
+                        <div>
+                            <label><i class="fas fa-calendar-alt"></i> Date</label>
+                            <input type="date" name="date" id="date" class="form-control" value="<?php echo $_POST['date'] ?? date('Y-m-d'); ?>" required>
+                        </div>
+
+                        <div style="align-self: end;">
+                            <button type="submit" name="load_students" class="btn blue">
+                                <i class="fas fa-list"></i> Load Students
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+
+            <?php if (!empty($students)): ?>
+                <form method="POST" id="attendanceForm">
+                    <input type="hidden" name="teacher_id" value="<?php echo htmlspecialchars($_POST['teacher_id'] ?? ''); ?>">
+                    <input type="hidden" name="class_id" value="<?php echo htmlspecialchars($_POST['class_id'] ?? ''); ?>">
+                    <input type="hidden" name="campus_id" value="<?php echo htmlspecialchars($_POST['campus_id'] ?? ''); ?>">
+                    <input type="hidden" name="date" value="<?php echo htmlspecialchars($_POST['date'] ?? date('Y-m-d')); ?>">
+                    
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Student</th>
+                                    <th>Reg No</th>
+                                    <th>Semester</th>
+                                    <th>Type</th>
+                                    <th>Emails</th>
+                                    <th>Attendance</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php 
+                                $i = 1; 
+                                foreach ($students as $student): 
+                                    $student_id = $student['student_id'];
+                                    $existing_status = $student['attendance_status'] ?? '';
+                                    $student_type = $student['student_type'] ?? 'regular';
+                                ?>
+                                    <tr>
+                                        <td><?php echo $i++; ?></td>
+                                        <td><?php echo htmlspecialchars($student['full_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($student['reg_no']); ?></td>
+                                        <td><?php echo htmlspecialchars($student['semester_name'] ?? 'N/A'); ?></td>
+                                        <td>
+                                            <span class="student-type-badge <?php echo $student_type; ?>">
+                                                <?php echo ucfirst($student_type); ?>
+                                            </span>
+                                        </td>
+                                        <td>
+                                            <?php if(!empty($student['student_email'])): ?>
+                                                <span class="email-status sent">
+                                                    <i class="fas fa-check"></i> Student
+                                                </span><br>
+                                            <?php else: ?>
+                                                <span class="email-status missing">
+                                                    <i class="fas fa-times"></i> Student
+                                                </span><br>
+                                            <?php endif; ?>
+                                            
+                                            <?php if(!empty($student['parent_email'])): ?>
+                                                <span class="email-status sent">
+                                                    <i class="fas fa-check"></i> Parent
+                                                </span>
+                                            <?php else: ?>
+                                                <span class="email-status missing">
+                                                    <i class="fas fa-times"></i> Parent
+                                                </span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <div class="attendance-buttons">
+                                                <button type="button" class="attendance-btn present <?php echo $existing_status == 'present' ? 'selected' : ''; ?>" 
+                                                        data-student="<?php echo $student_id; ?>" data-status="present">
+                                                    Present
+                                                </button>
+                                                <button type="button" class="attendance-btn absent <?php echo $existing_status == 'absent' ? 'selected' : ''; ?>" 
+                                                        data-student="<?php echo $student_id; ?>" data-status="absent">
+                                                    Absent
+                                                </button>
+                                                <button type="button" class="attendance-btn late <?php echo $existing_status == 'late' ? 'selected' : ''; ?>" 
+                                                        data-student="<?php echo $student_id; ?>" data-status="late">
+                                                    Late
+                                                </button>
+                                                <button type="button" class="attendance-btn excused <?php echo $existing_status == 'excused' ? 'selected' : ''; ?>" 
+                                                        data-student="<?php echo $student_id; ?>" data-status="excused">
+                                                    Excused
+                                                </button>
+                                                <input type="hidden" name="attendance[<?php echo $student_id; ?>]" 
+                                                       id="attendance_<?php echo $student_id; ?>" 
+                                                       value="<?php echo htmlspecialchars($existing_status ?: 'present'); ?>">
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="actions">
+                        <button name="action" value="student_save" class="btn green" type="submit">
+                            <i class="fas fa-save"></i> Save Attendance
+                        </button>
+                        <button name="action" value="student_unlock" class="btn red" type="submit" 
+                                onclick="return confirm('Are you sure you want to unlock attendance? This will delete existing records for this class.')">
+                            <i class="fas fa-unlock"></i> Unlock Attendance
+                        </button>
+                    </div>
+                </form>
+            <?php endif; ?>
+        </div>
+
+        <!-- ================= TAB 2: STUDENT VIEW ================= -->
+        <div id="tab2" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Student</th>
+                            <th>Reg No</th>
+                            <th>Class</th>
+                            <th>Subject</th>
+                            <th>Teacher</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Emails</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($attendance_view)): ?>
+                            <?php foreach($attendance_view as $a): ?>
+                                <tr>
+                                    <td><?php echo htmlspecialchars($a['attendance_date']); ?></td>
+                                    <td><?php echo htmlspecialchars($a['full_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($a['reg_no']); ?></td>
+                                    <td><?php echo htmlspecialchars($a['class_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($a['subject_name'] ?? 'N/A'); ?></td>
+                                    <td><?php echo htmlspecialchars($a['teacher_name']); ?></td>
+                                    <td>
+                                        <span class="student-type-badge <?php echo strtolower($a['student_type']); ?>">
+                                            <?php echo htmlspecialchars($a['student_type']); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <?php if ($a['status'] == 'present'): ?>
+                                            <span style="color:green;font-weight:bold;">
+                                                <i class="fas fa-check-circle"></i> Present
+                                            </span>
+                                        <?php elseif ($a['status'] == 'absent'): ?>
+                                            <span style="color:red;font-weight:bold;">
+                                                <i class="fas fa-times-circle"></i> Absent
+                                            </span>
+                                        <?php elseif ($a['status'] == 'late'): ?>
+                                            <span style="color:orange;font-weight:bold;">
+                                                <i class="fas fa-clock"></i> Late
+                                            </span>
+                                        <?php else: ?>
+                                            <span style="color:blue;font-weight:bold;">
+                                                <i class="fas fa-user-clock"></i> Excused
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <?php if(!empty($a['student_email'])): ?>
+                                            <span class="email-status sent">
+                                                <i class="fas fa-user-graduate"></i> Student
+                                            </span><br>
+                                        <?php endif; ?>
+                                        <?php if(!empty($a['parent_email'])): ?>
+                                            <span class="email-status sent">
+                                                <i class="fas fa-users"></i> Parent
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="9" style="text-align:center; padding: 40px; color: #666;">
+                                    <i class="fas fa-clipboard-list fa-3x mb-3" style="color: #ddd;"></i><br>
+                                    No student attendance records found.
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================= TAB 3: TEACHER RECORD ================= -->
+        <div id="tab3" class="tab-content">
+            <div class="filter-box">
+                <form method="POST">
+                    <div class="grid">
+                        <!-- 👨‍🏫 TEACHER -->
+                        <div>
+                            <label><i class="fas fa-chalkboard-teacher"></i> Teacher</label>
+                            <select name="teacher_id" class="form-select" required>
+                                <option value="">Select Teacher</option>
+                                <?php foreach($teachers as $t): ?>
+                                    <option value="<?php echo htmlspecialchars($t['teacher_id']); ?>" 
+                                        <?php echo (!empty($_POST['teacher_id']) && $_POST['teacher_id']==$t['teacher_id'])?'selected':''; ?>>
+                                        <?php echo htmlspecialchars($t['teacher_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- 📅 DATE -->
+                        <div>
+                            <label><i class="fas fa-calendar-alt"></i> Date</label>
+                            <input type="date" name="date" class="form-control" 
+                                   value="<?php echo htmlspecialchars($_POST['date'] ?? date('Y-m-d')); ?>" required>
+                        </div>
+
+                        <!-- ⚙️ ACTION -->
+                        <div>
+                            <label><i class="fas fa-cogs"></i> Action</label>
+                            <select name="io_action" class="form-select" required>
+                                <option value="">Select</option>
+                                <option value="In">Time In</option>
+                                <option value="Out">Time Out</option>
+                            </select>
+                        </div>
+
+                        <!-- 📝 NOTES -->
+                        <div>
+                            <label><i class="fas fa-sticky-note"></i> Notes</label>
+                            <input type="text" name="notes" class="form-control" 
+                                   placeholder="Optional notes..." 
+                                   value="<?php echo htmlspecialchars($_POST['notes'] ?? ''); ?>">
+                        </div>
+
+                        <!-- 💾 BUTTONS -->
+                        <div style="align-self:end;">
+                            <button name="action" value="teacher_save" class="btn green">
+                                <i class="fas fa-save"></i> Save
+                            </button>
+                            <button name="action" value="teacher_unlock" class="btn red" 
+                                    onclick="return confirm('Are you sure you want to unlock teacher attendance?')">
+                                <i class="fas fa-unlock"></i> Unlock
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ================= TAB 4: TEACHER VIEW ================= -->
+        <div id="tab4" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Teacher</th>
+                            <th>Time In</th>
+                            <th>Time Out</th>
+                            <th>Minutes Worked</th>
+                            <th>Notes</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($teacher_view)): ?>
+                            <?php foreach($teacher_view as $tv): ?>
+                                <tr>
+                                    <td><?php echo htmlspecialchars($tv['date']); ?></td>
+                                    <td><?php echo htmlspecialchars($tv['teacher_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($tv['time_in']); ?></td>
+                                    <td>
+                                        <?php if ($tv['time_out']): ?>
+                                            <?php echo htmlspecialchars($tv['time_out']); ?>
+                                            <?php if (strpos($tv['notes'] ?? '', 'Auto-Out') !== false): ?>
+                                                <span style="color:#f57c00;font-size:11px;margin-left:5px;">
+                                                    <i class="fas fa-robot"></i> (Auto)
+                                                </span>
+                                            <?php endif; ?>
+                                        <?php else: ?>
+                                            <span style="color:#4CAF50;">
+                                                <i class="fas fa-clock"></i> Still Working
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><?php echo htmlspecialchars($tv['minutes_worked']); ?></td>
+                                    <td><?php echo htmlspecialchars($tv['notes']); ?></td>
+                                    <td>
+                                        <?php if ($tv['time_out']): ?>
+                                            <span style="color:#2196F3;font-weight:bold;">
+                                                <i class="fas fa-door-closed"></i> Checked Out
+                                            </span>
+                                        <?php else: ?>
+                                            <span style="color:#4CAF50;font-weight:bold;">
+                                                <i class="fas fa-door-open"></i> Checked In
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="7" style="text-align:center; padding: 40px; color: #666;">
+                                    <i class="fas fa-chalkboard-teacher fa-3x mb-3" style="color: #ddd;"></i><br>
+                                    No teacher attendance records found.
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================= TAB 5: EMAIL LOGS ================= -->
+        <div id="tab5" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Student</th>
+                            <th>Recipient</th>
+                            <th>Subject</th>
+                            <th>Type</th>
+                            <th>Absences</th>
+                            <th>Status</th>
+                            <th>Error</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($email_logs)): ?>
+                            <?php foreach($email_logs as $log): ?>
+                                <tr>
+                                    <td><?php echo htmlspecialchars($log['sent_at']); ?></td>
+                                    <td><?php echo htmlspecialchars($log['full_name'] ?? 'N/A'); ?></td>
+                                    <td><?php echo htmlspecialchars($log['recipient_email']); ?></td>
+                                    <td title="<?php echo htmlspecialchars($log['subject']); ?>">
+                                        <?php echo htmlspecialchars(substr($log['subject'], 0, 30)); ?>...
+                                    </td>
+                                    <td>
+                                        <?php if ($log['message_type'] == 'warning'): ?>
+                                            <span class="badge bg-warning">Warning</span>
+                                        <?php elseif ($log['message_type'] == 'recourse'): ?>
+                                            <span class="badge bg-danger">Recourse</span>
+                                        <?php else: ?>
+                                            <span class="badge bg-secondary">Other</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><?php echo htmlspecialchars($log['absence_count'] ?? 'N/A'); ?></td>
+                                    <td>
+                                        <?php if ($log['status'] == 'sent'): ?>
+                                            <span class="badge bg-success">
+                                                <i class="fas fa-check"></i> Sent
+                                            </span>
+                                        <?php else: ?>
+                                            <span class="badge bg-danger">
+                                                <i class="fas fa-times"></i> Failed
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td title="<?php echo htmlspecialchars($log['error_message'] ?? ''); ?>">
+                                        <?php echo htmlspecialchars(substr($log['error_message'] ?? '', 0, 20)); ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="8" style="text-align:center; padding: 40px; color: #666;">
+                                    <i class="fas fa-envelope fa-3x mb-3" style="color: #ddd;"></i><br>
+                                    No email logs found. Emails will appear here after being sent.
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================= TAB 6: RECOURSE STUDENTS ================= -->
+        <div id="tab6" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Student</th>
+                            <th>Reg No</th>
+                            <th>Subject</th>
+                            <th>Original Class</th>
+                            <th>Recourse Class</th>
+                            <th>Academic Term</th>
+                            <th>Status</th>
+                            <th>Created</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($recourse_students)): ?>
+                            <?php $i = 1; foreach($recourse_students as $rs): ?>
+                                <tr>
+                                    <td><?php echo $i++; ?></td>
+                                    <td><?php echo htmlspecialchars($rs['full_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($rs['reg_no']); ?></td>
+                                    <td><?php echo htmlspecialchars($rs['subject_name']); ?></td>
+                                    <td>
+                                        <?php echo htmlspecialchars($rs['original_campus']); ?> /
+                                        <?php echo htmlspecialchars($rs['original_faculty']); ?> /
+                                        <?php echo htmlspecialchars($rs['original_class']); ?>
+                                    </td>
+                                    <td>
+                                        <?php echo htmlspecialchars($rs['recourse_campus']); ?> /
+                                        <?php echo htmlspecialchars($rs['recourse_faculty']); ?> /
+                                        <?php echo htmlspecialchars($rs['recourse_class']); ?>
+                                    </td>
+                                    <td>
+                                        <?php if($rs['academic_term_id'] == $academic_term_id): ?>
+                                            <span style="color:green;font-weight:bold;">
+                                                <i class="fas fa-circle"></i> Current
+                                            </span>
+                                        <?php else: ?>
+                                            <?php echo htmlspecialchars($rs['term_name'] ?? 'N/A'); ?>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <span class="student-type-badge <?php echo $rs['status']; ?>">
+                                            <?php echo ucfirst($rs['status']); ?>
+                                        </span>
+                                    </td>
+                                    <td><?php echo htmlspecialchars($rs['created_at']); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="9" style="text-align:center; padding: 40px; color: #666;">
+                                    <i class="fas fa-redo fa-3x mb-3" style="color: #ddd;"></i><br>
+                                    No recourse student records found.
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================= TAB 7: ATTENDANCE CORRECTIONS ================= -->
+        <div id="tab7" class="tab-content">
+            <div style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+                <button class="btn blue" onclick="openCorrectionModal()">
+                    <i class="fas fa-plus-circle"></i> Request Correction
+                </button>
+                
+                <div class="quick-actions">
+                    <button class="btn yellow" onclick="window.location.href='?send_absence_emails=now'">
+                        <i class="fas fa-paper-plane"></i> Send Today's Absence Emails
+                    </button>
+                </div>
+            </div>
+
+            <div class="tabs" style="margin-bottom: 20px;">
+                <button class="tab-btn small active" data-subtab="pending-corrections">
+                    Pending <span class="badge bg-warning"><?php echo count($pending_corrections); ?></span>
+                </button>
+                <button class="tab-btn small" data-subtab="approved-corrections">
+                    Approved <span class="badge bg-success"><?php echo count($approved_corrections); ?></span>
+                </button>
+                <button class="tab-btn small" data-subtab="rejected-corrections">
+                    Rejected <span class="badge bg-danger"><?php echo count($rejected_corrections); ?></span>
+                </button>
+            </div>
+
+            <!-- Pending Corrections -->
+            <div id="pending-corrections" class="subtab-content active">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Student</th>
+                                <th>Reg No</th>
+                                <th>Subject</th>
+                                <th>Teacher</th>
+                                <th>Date</th>
+                                <th>Correction</th>
+                                <th>Reason</th>
+                                <th>Requested</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!empty($pending_corrections)): ?>
+                                <?php $i = 1; foreach($pending_corrections as $corr): ?>
+                                    <tr>
+                                        <td><?php echo $i++; ?></td>
+                                        <td><?php echo htmlspecialchars($corr['student_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['reg_no']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['subject_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['teacher_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['correction_date']); ?></td>
+                                        <td>
+                                            <div class="status-change">
+                                                <span class="from"><?php echo ucfirst($corr['original_status'] ?? 'absent'); ?></span>
+                                                <span class="arrow"><i class="fas fa-arrow-right"></i></span>
+                                                <span class="to"><?php echo ucfirst($corr['corrected_status'] ?? 'present'); ?></span>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <strong><?php echo ucfirst(str_replace('_', ' ', $corr['reason'])); ?></strong><br>
+                                            <small><?php echo htmlspecialchars($corr['reason_details']); ?></small>
+                                        </td>
+                                        <td>
+                                            <?php echo date('Y-m-d H:i', strtotime($corr['created_at'])); ?><br>
+                                            <small>By: <?php echo htmlspecialchars($corr['requested_by']); ?></small>
+                                        </td>
+                                        <td>
+                                            <button class="btn btn-sm btn-success" 
+                                                    onclick="approveCorrection(<?php echo $corr['correction_id']; ?>)">
+                                                <i class="fas fa-check"></i> Approve
+                                            </button>
+                                            <button class="btn btn-sm btn-danger" 
+                                                    onclick="openRejectModal(<?php echo $corr['correction_id']; ?>)">
+                                                <i class="fas fa-times"></i> Reject
+                                            </button>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <tr>
+                                    <td colspan="10" style="text-align:center; padding: 40px; color: #666;">
+                                        <i class="fas fa-check-circle fa-3x mb-3" style="color: #ddd;"></i><br>
+                                        No pending correction requests.
+                                    </td>
+                                </tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Approved Corrections -->
+            <div id="approved-corrections" class="subtab-content">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Student</th>
+                                <th>Reg No</th>
+                                <th>Subject</th>
+                                <th>Date</th>
+                                <th>Correction</th>
+                                <th>Reason</th>
+                                <th>Requested By</th>
+                                <th>Approved By</th>
+                                <th>Approved At</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!empty($approved_corrections)): ?>
+                                <?php $i = 1; foreach($approved_corrections as $corr): ?>
+                                    <tr>
+                                        <td><?php echo $i++; ?></td>
+                                        <td><?php echo htmlspecialchars($corr['student_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['reg_no']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['subject_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['correction_date']); ?></td>
+                                        <td>
+                                            <div class="status-change">
+                                                <span class="from"><?php echo ucfirst($corr['original_status'] ?? 'absent'); ?></span>
+                                                <span class="arrow"><i class="fas fa-arrow-right"></i></span>
+                                                <span class="to"><?php echo ucfirst($corr['corrected_status'] ?? 'present'); ?></span>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <strong><?php echo ucfirst(str_replace('_', ' ', $corr['reason'])); ?></strong>
+                                        </td>
+                                        <td><?php echo htmlspecialchars($corr['requested_by']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['approved_by']); ?></td>
+                                        <td><?php echo date('Y-m-d H:i', strtotime($corr['approved_at'])); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <tr>
+                                    <td colspan="10" style="text-align:center; padding: 40px; color: #666;">
+                                        <i class="fas fa-history fa-3x mb-3" style="color: #ddd;"></i><br>
+                                        No approved corrections found.
+                                    </td>
+                                </tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Rejected Corrections -->
+            <div id="rejected-corrections" class="subtab-content">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Student</th>
+                                <th>Reg No</th>
+                                <th>Subject</th>
+                                <th>Date</th>
+                                <th>Correction</th>
+                                <th>Reason</th>
+                                <th>Requested By</th>
+                                <th>Rejected At</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!empty($rejected_corrections)): ?>
+                                <?php $i = 1; foreach($rejected_corrections as $corr): ?>
+                                    <tr>
+                                        <td><?php echo $i++; ?></td>
+                                        <td><?php echo htmlspecialchars($corr['student_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['reg_no']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['subject_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($corr['correction_date']); ?></td>
+                                        <td>
+                                            <div class="status-change">
+                                                <span class="from"><?php echo ucfirst($corr['original_status'] ?? 'absent'); ?></span>
+                                                <span class="arrow"><i class="fas fa-arrow-right"></i></span>
+                                                <span class="to"><?php echo ucfirst($corr['corrected_status'] ?? 'present'); ?></span>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <strong><?php echo ucfirst(str_replace('_', ' ', $corr['reason'])); ?></strong>
+                                        </td>
+                                        <td><?php echo htmlspecialchars($corr['requested_by']); ?></td>
+                                        <td><?php echo date('Y-m-d H:i', strtotime($corr['rejected_at'])); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <tr>
+                                    <td colspan="9" style="text-align:center; padding: 40px; color: #666;">
+                                        <i class="fas fa-ban fa-3x mb-3" style="color: #ddd;"></i><br>
+                                        No rejected corrections found.
+                                    </td>
+                                </tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Correction Request Modal -->
+        <div id="correctionModal" class="correction-modal">
+            <div class="correction-modal-content">
+                <h3><i class="fas fa-edit"></i> Request Attendance Correction</h3>
+                <form id="correctionForm" method="POST">
+                    <input type="hidden" name="action" value="request_correction">
+                    
+                    <div class="mb-3">
+                        <label>Student Registration Number</label>
+                        <input type="text" id="studentRegNo" class="form-control" placeholder="Enter reg no or name...">
+                        <div id="studentSearchResults" style="display:none; max-height: 200px; overflow-y: auto; border: 1px solid #ddd; margin-top: 5px;"></div>
+                        <input type="hidden" id="student_id" name="student_id">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label>Correction Date</label>
+                        <input type="date" id="correction_date" name="correction_date" class="form-control" required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label>Select Attendance Record</label>
+                        <select id="attendanceSelect" name="attendance_id" class="form-control" required disabled>
+                            <option value="">Select attendance record</option>
+                        </select>
+                        <input type="hidden" id="subject_id" name="subject_id">
+                        <input type="hidden" id="original_status" name="original_status">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label>Corrected Status</label>
+                        <select name="corrected_status" class="form-control" required>
+                            <option value="">Select status</option>
+                            <option value="present">Present</option>
+                            <option value="absent">Absent</option>
+                            <option value="late">Late</option>
+                            <option value="excused">Excused</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label>Reason</label>
+                        <select name="reason" class="form-control" required>
+                            <option value="">Select reason</option>
+                            <option value="system_error">System Error</option>
+                            <option value="teacher_mistake">Teacher Mistake</option>
+                            <option value="medical">Medical Reason</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label>Reason Details</label>
+                        <textarea name="reason_details" class="form-control" rows="3" placeholder="Provide details..."></textarea>
+                    </div>
+                    
+                    <div style="display: flex; gap: 10px; margin-top: 20px;">
+                        <button type="submit" class="btn green" style="flex: 1;">
+                            <i class="fas fa-paper-plane"></i> Submit Request
+                        </button>
+                        <button type="button" class="btn red" onclick="closeCorrectionModal()" style="flex: 1;">
+                            <i class="fas fa-times"></i> Cancel
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Reject Modal -->
+        <div id="rejectModal" class="reject-modal">
+            <div class="reject-modal-content">
+                <h3><i class="fas fa-times-circle"></i> Reject Correction Request</h3>
+                <input type="hidden" id="rejectCorrectionId">
+                <div class="mb-3">
+                    <label>Rejection Reason</label>
+                    <textarea id="rejectionReason" class="form-control" rows="4" placeholder="Enter reason for rejection..." required></textarea>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button type="button" class="btn red" onclick="rejectCorrection()" style="flex: 1;">
+                        <i class="fas fa-times"></i> Reject
+                    </button>
+                    <button type="button" class="btn blue" onclick="closeRejectModal()" style="flex: 1;">
+                        <i class="fas fa-times"></i> Cancel
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    $(document).ready(function() {
+        // ✅ Tab Switching
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById(btn.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Sub-tab switching for corrections
+        document.querySelectorAll('[data-subtab]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('[data-subtab]').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.subtab-content').forEach(c => c.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById(btn.dataset.subtab).classList.add('active');
+            });
+        });
+
+        // ===========================================
+        // ATTENDANCE HIERARCHY FUNCTIONS
+        // ===========================================
+
+        // Campus Change
+        $('#campus_id').change(function() {
+            var campusId = $(this).val();
+            $('#faculty_id').html('<option value="">Select Faculty</option>').prop('disabled', true);
+            $('#department_id').html('<option value="">Select Department</option>').prop('disabled', true);
+            $('#program_id').html('<option value="">Select Program</option>').prop('disabled', true);
+            $('#class_id').html('<option value="">Select Class</option>').prop('disabled', true);
+            
+            if(campusId) {
+                $.ajax({
+                    url: window.location.pathname,
+                    type: 'GET',
+                    data: {
+                        ajax: 'get_faculties_by_campus',
+                        campus_id: campusId
+                    },
+                    dataType: 'json',
+                    success: function(data) {
+                        if(data.status === 'success') {
+                            $('#faculty_id').html('<option value="">Select Faculty</option>');
+                            $.each(data.faculties, function(index, faculty) {
+                                $('#faculty_id').append('<option value="'+faculty.faculty_id+'">'+faculty.faculty_name+'</option>');
+                            });
+                            $('#faculty_id').prop('disabled', false);
+                            
+                            // Trigger change if there's already a selected value
+                            var selectedFacultyId = '<?php echo $_POST["faculty_id"] ?? ""; ?>';
+                            if(selectedFacultyId) {
+                                $('#faculty_id').val(selectedFacultyId).trigger('change');
+                            }
+                        }
+                    },
+                    error: function() {
+                        alert('Error loading faculties');
+                    }
+                });
+            }
+        });
+
+        // Faculty Change
+        $('#faculty_id').change(function() {
+            var facultyId = $(this).val();
+            var campusId = $('#campus_id').val();
+            $('#department_id').html('<option value="">Select Department</option>').prop('disabled', true);
+            $('#program_id').html('<option value="">Select Program</option>').prop('disabled', true);
+            $('#class_id').html('<option value="">Select Class</option>').prop('disabled', true);
+            
+            if(facultyId && campusId) {
+                $.ajax({
+                    url: window.location.pathname,
+                    type: 'GET',
+                    data: {
+                        ajax: 'get_departments_by_faculty',
+                        faculty_id: facultyId,
+                        campus_id: campusId
+                    },
+                    dataType: 'json',
+                    success: function(data) {
+                        if(data.status === 'success') {
+                            $('#department_id').html('<option value="">Select Department</option>');
+                            $.each(data.departments, function(index, department) {
+                                $('#department_id').append('<option value="'+department.department_id+'">'+department.department_name+'</option>');
+                            });
+                            $('#department_id').prop('disabled', false);
+                            
+                            // Trigger change if there's already a selected value
+                            var selectedDeptId = '<?php echo $_POST["department_id"] ?? ""; ?>';
+                            if(selectedDeptId) {
+                                $('#department_id').val(selectedDeptId).trigger('change');
+                            }
+                        }
+                    },
+                    error: function() {
+                        alert('Error loading departments');
+                    }
+                });
+            }
+        });
+
+        // Department Change
+        $('#department_id').change(function() {
+            var departmentId = $(this).val();
+            var facultyId = $('#faculty_id').val();
+            var campusId = $('#campus_id').val();
+            $('#program_id').html('<option value="">Select Program</option>').prop('disabled', true);
+            $('#class_id').html('<option value="">Select Class</option>').prop('disabled', true);
+            
+            if(departmentId && facultyId && campusId) {
+                $.ajax({
+                    url: window.location.pathname,
+                    type: 'GET',
+                    data: {
+                        ajax: 'get_programs_by_department',
+                        department_id: departmentId,
+                        faculty_id: facultyId,
+                        campus_id: campusId
+                    },
+                    dataType: 'json',
+                    success: function(data) {
+                        if(data.status === 'success') {
+                            $('#program_id').html('<option value="">Select Program</option>');
+                            $.each(data.programs, function(index, program) {
+                                $('#program_id').append('<option value="'+program.program_id+'">'+program.program_name+'</option>');
+                            });
+                            $('#program_id').prop('disabled', false);
+                            
+                            // Trigger change if there's already a selected value
+                            var selectedProgramId = '<?php echo $_POST["program_id"] ?? ""; ?>';
+                            if(selectedProgramId) {
+                                $('#program_id').val(selectedProgramId).trigger('change');
+                            }
+                        }
+                    },
+                    error: function() {
+                        alert('Error loading programs');
+                    }
+                });
+            }
+        });
+
+        // Program Change
+        $('#program_id').change(function() {
+            var programId = $(this).val();
+            var departmentId = $('#department_id').val();
+            var facultyId = $('#faculty_id').val();
+            var campusId = $('#campus_id').val();
+            $('#class_id').html('<option value="">Select Class</option>').prop('disabled', true);
+            
+            if(programId && departmentId && facultyId && campusId) {
+                $.ajax({
+                    url: window.location.pathname,
+                    type: 'GET',
+                    data: {
+                        ajax: 'get_classes_by_program',
+                        program_id: programId,
+                        department_id: departmentId,
+                        faculty_id: facultyId,
+                        campus_id: campusId
+                    },
+                    dataType: 'json',
+                    success: function(data) {
+                        if(data.status === 'success') {
+                            $('#class_id').html('<option value="">Select Class</option>');
+                            $.each(data.classes, function(index, cls) {
+                                $('#class_id').append('<option value="'+cls.class_id+'">'+cls.class_name+'</option>');
+                            });
+                            $('#class_id').prop('disabled', false);
+                            
+                            // Trigger change if there's already a selected value
+                            var selectedClassId = '<?php echo $_POST["class_id"] ?? ""; ?>';
+                            if(selectedClassId) {
+                                $('#class_id').val(selectedClassId);
+                            }
+                        }
+                    },
+                    error: function() {
+                        alert('Error loading classes');
+                    }
+                });
+            }
+        });
+
+        // Class Change
+        $('#class_id').change(function() {
+            $('#teacher_id').focus();
+        });
+
+        // Initialize hierarchy on page load
+        function initializeHierarchy() {
+            var campusId = $('#campus_id').val();
+            if(campusId) {
+                $('#campus_id').trigger('change');
+            }
+        }
+        
+        // Call initialization on page load
+        initializeHierarchy();
+
+        // Attendance button functionality
+        document.querySelectorAll('.attendance-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const studentId = this.getAttribute('data-student');
+                const status = this.getAttribute('data-status');
+                
+                // Remove selected class from all buttons in this group
+                this.parentNode.querySelectorAll('.attendance-btn').forEach(b => {
+                    b.classList.remove('selected');
+                });
+                
+                // Add selected class to clicked button
+                this.classList.add('selected');
+                
+                // Update hidden input value
+                document.getElementById('attendance_' + studentId).value = status;
+            });
+        });
+
+        // ===========================================
+        // CORRECTION FUNCTIONS
+        // ===========================================
+
+        // Student search
+        $('#studentRegNo').on('keyup', function() {
+            const query = $(this).val();
+            if (query.length < 2) {
+                $('#studentSearchResults').hide();
+                return;
+            }
+            
+            $.ajax({
+                url: window.location.pathname,
+                type: 'GET',
+                data: {
+                    ajax: 'search_students',
+                    query: query
+                },
+                success: function(data) {
+                    if (data.status === 'success') {
+                        const results = $('#studentSearchResults');
+                        results.empty();
+                        
+                        if (data.students.length > 0) {
+                            data.students.forEach(student => {
+                                results.append(`
+                                    <div class="student-result" 
+                                         data-id="${student.student_id}"
+                                         data-name="${student.full_name}"
+                                         data-reg="${student.reg_no}"
+                                         style="padding: 10px; border-bottom: 1px solid #eee; cursor: pointer;">
+                                        <strong>${student.full_name}</strong><br>
+                                        <small>${student.reg_no}</small>
+                                    </div>
+                                `);
+                            });
+                            results.show();
+                        } else {
+                            results.hide();
+                        }
+                    }
+                }
+            });
+        });
+
+        // Student selection
+        $(document).on('click', '.student-result', function() {
+            const studentId = $(this).data('id');
+            const studentName = $(this).data('name');
+            const studentReg = $(this).data('reg');
+            
+            $('#student_id').val(studentId);
+            $('#studentRegNo').val(studentReg + ' - ' + studentName);
+            $('#studentSearchResults').hide();
+            
+            // Load student's attendance records
+            loadStudentAttendance(studentId);
+        });
+
+        // Load attendance records when date changes
+        $('#correction_date').change(function() {
+            const studentId = $('#student_id').val();
+            if (studentId) {
+                loadStudentAttendance(studentId);
+            }
+        });
+
+        function loadStudentAttendance(studentId) {
+            const date = $('#correction_date').val();
+            if (!date) return;
+            
+            $.ajax({
+                url: window.location.pathname,
+                type: 'GET',
+                data: {
+                    ajax: 'get_student_attendance',
+                    student_id: studentId,
+                    date: date
+                },
+                success: function(data) {
+                    const select = $('#attendanceSelect');
+                    select.empty().append('<option value="">Select attendance record</option>');
+                    
+                    if (data.status === 'success' && data.attendance.length > 0) {
+                        data.attendance.forEach(record => {
+                            select.append(`
+                                <option value="${record.attendance_id}"
+                                        data-subject="${record.subject_id}"
+                                        data-status="${record.status}">
+                                    ${record.subject_name} - ${record.teacher_name} (${record.status})
+                                </option>
+                            `);
+                        });
+                        select.prop('disabled', false);
+                    } else {
+                        select.append('<option value="">No attendance records found for this date</option>');
+                        select.prop('disabled', true);
+                    }
+                }
+            });
+        }
+
+        // When attendance record is selected
+        $('#attendanceSelect').change(function() {
+            const selected = $(this).find(':selected');
+            $('#subject_id').val(selected.data('subject') || '');
+            $('#original_status').val(selected.data('status') || '');
+            
+            // Set corrected status dropdown to not be the same as original
+            const correctedSelect = $('select[name="corrected_status"]');
+            correctedSelect.val('');
+        });
+
+        // If URL has view parameter, switch to that tab
+        const urlParams = new URLSearchParams(window.location.search);
+        const viewParam = urlParams.get('view');
+        if (viewParam === 'email_logs') {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            const emailTabBtn = document.querySelector('.tab-btn[data-tab="tab5"]');
+            if (emailTabBtn) {
+                emailTabBtn.classList.add('active');
+                document.getElementById('tab5').classList.add('active');
+            }
+        }
+
+        // Auto-refresh email logs every 2 minutes
+        setInterval(() => {
+            if (!document.hidden && document.querySelector('.tab-content.active')) {
+                const activeTab = document.querySelector('.tab-content.active').id;
+                if (activeTab === 'tab5') {
+                    window.location.reload();
+                }
+            }
+        }, 120000);
+    });
+
+    // Modal Functions
+    function openCorrectionModal() {
+        document.getElementById('correctionModal').style.display = 'flex';
+        document.getElementById('studentRegNo').focus();
+    }
+
+    function closeCorrectionModal() {
+        document.getElementById('correctionModal').style.display = 'none';
+        document.getElementById('correctionForm').reset();
+        $('#studentSearchResults').hide();
+        $('#attendanceSelect').prop('disabled', true);
+    }
+
+    function openRejectModal(correctionId) {
+        document.getElementById('rejectModal').style.display = 'flex';
+        document.getElementById('rejectCorrectionId').value = correctionId;
+        document.getElementById('rejectionReason').focus();
+    }
+
+    function closeRejectModal() {
+        document.getElementById('rejectModal').style.display = 'none';
+        document.getElementById('rejectionReason').value = '';
+    }
+
+    function approveCorrection(correctionId) {
+        if (!confirm('Are you sure you want to approve this correction? The attendance record will be updated immediately.')) {
+            return;
+        }
+        
+        $.ajax({
+            url: window.location.pathname,
+            type: 'GET',
+            data: {
+                ajax: 'approve_correction',
+                correction_id: correctionId
+            },
+            success: function(data) {
+                if (data.success) {
+                    alert(`Correction approved successfully!\nStudent: ${data.student_name}\nChanged from: ${data.original_status} to: ${data.corrected_status}`);
+                    window.location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            },
+            error: function() {
+                alert('Error approving correction');
+            }
+        });
+    }
+
+    function rejectCorrection() {
+        const correctionId = document.getElementById('rejectCorrectionId').value;
+        const reason = document.getElementById('rejectionReason').value.trim();
+        
+        if (!reason) {
+            alert('Please provide a rejection reason');
+            return;
+        }
+        
+        if (!confirm('Are you sure you want to reject this correction request?')) {
+            return;
+        }
+        
+        $.ajax({
+            url: window.location.pathname,
+            type: 'GET',
+            data: {
+                ajax: 'reject_correction',
+                correction_id: correctionId,
+                reason: reason
+            },
+            success: function(data) {
+                if (data.success) {
+                    alert('Correction request rejected successfully!');
+                    window.location.reload();
+                } else {
+                    alert('Error rejecting correction');
+                }
+            },
+            error: function() {
+                alert('Error rejecting correction');
+            }
+        });
+    }
+
+    // Close modal when clicking outside
+    window.onclick = function(event) {
+        const correctionModal = document.getElementById('correctionModal');
+        const rejectModal = document.getElementById('rejectModal');
+        
+        if (event.target === correctionModal) {
+            closeCorrectionModal();
+        }
+        if (event.target === rejectModal) {
+            closeRejectModal();
+        }
+    };
+
+    // Prevent form submission if student not selected
+    document.getElementById('correctionForm').addEventListener('submit', function(e) {
+        const studentId = document.getElementById('student_id').value;
+        const subjectId = document.getElementById('subject_id').value;
+        const correctedStatus = document.querySelector('select[name="corrected_status"]').value;
+        const originalStatus = document.getElementById('original_status').value;
+        
+        if (!studentId) {
+            alert('Please select a student');
+            e.preventDefault();
+            return;
+        }
+        
+        if (!subjectId) {
+            alert('Please select an attendance record');
+            e.preventDefault();
+            return;
+        }
+        
+        if (correctedStatus === originalStatus) {
+            alert('Corrected status must be different from original status');
+            e.preventDefault();
+            return;
+        }
+    });
+    </script>
+    <?php include('../includes/footer.php'); ?>
+
+</body>
+</html>
+<?php ob_end_flush(); ?>

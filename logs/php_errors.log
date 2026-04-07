@@ -1,0 +1,44 @@
+[30-Dec-2025 01:14:36 Africa/Nairobi] ❌ Attendance Error: Attendance already saved for one or more students. Please unlock before editing.
+[30-Dec-2025 01:14:36 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:36 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:36 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:50 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:50 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:50 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:53 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:53 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:14:53 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:08 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:08 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:08 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:15 Africa/Nairobi] 📊 Student 1 has 1 absences in MATH
+[30-Dec-2025 01:15:15 Africa/Nairobi] ❌ Attendance notification error: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'p.parent_name' in 'field list'
+[30-Dec-2025 01:15:15 Africa/Nairobi] 📊 Student 2 has 1 absences in MATH
+[30-Dec-2025 01:15:15 Africa/Nairobi] ❌ Attendance notification error: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'p.parent_name' in 'field list'
+[30-Dec-2025 01:15:15 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:15 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:15:15 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1327
+[30-Dec-2025 01:24:34 Africa/Nairobi] ❌ Attendance Error: Attendance already saved for one or more students. Please unlock before editing.
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $campuses in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 474
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 474
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $faculties in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 487
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 487
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $departments in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 500
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 500
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $programs in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 513
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 513
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $classes in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 526
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 526
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $teachers in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 539
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 539
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  Undefined variable $teachers in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 704
+[30-Dec-2025 01:24:34 Africa/Nairobi] PHP Warning:  foreach() argument must be of type array|object, null given in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 704
+[30-Dec-2025 01:37:52 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:37:52 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:37:52 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:38:14 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:38:14 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:38:14 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1124
+[30-Dec-2025 01:43:25 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1873
+[30-Dec-2025 01:43:25 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1873
+[30-Dec-2025 01:43:25 Africa/Nairobi] PHP Deprecated:  htmlspecialchars(): Passing null to parameter #1 ($string) of type string is deprecated in C:\xampp\htdocs\attendance_management_system\super_admin\attendance.php on line 1873
